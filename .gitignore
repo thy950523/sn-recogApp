@@ -23,3 +23,12 @@ dist-ssr
 *.sln
 *.sw?
 .pids/
+
+# Python virtualenv / caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local HTTPS keys/certs (never commit private keys)
+*.pem
