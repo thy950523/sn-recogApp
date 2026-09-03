@@ -18,8 +18,9 @@ export function normalizeSn(s: string): string {
 export function extractSnByMarker(text: string): string | null {
   const clean = text.toUpperCase().replace(/[\s　]/g, '')
   const patterns = [
-    /[S5][\/\\|I1L]?N[:：.;,]?([A-Z0-9]{6,20})/,
-    /SER[I1L]AL(?:N[O0Q][.:]?)?[:：.;,]?([A-Z0-9]{6,20})/,
+    // (?![A-Z0-9]) 负向前瞻：SN 后若紧跟更多字母数字，说明与相邻字段粘连，停止匹配
+    /[S5][\/\\|I1L]?N[:：.;,]?([A-Z0-9]{6,20})(?![A-Z0-9])/,
+    /SER[I1L]AL(?:N[O0Q][.:]?)?[:：.;,]?([A-Z0-9]{6,20})(?![A-Z0-9])/,
   ]
   for (const re of patterns) {
     const m = clean.match(re)
