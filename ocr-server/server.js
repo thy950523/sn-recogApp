@@ -19,7 +19,9 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import os from 'os'
 import { randomUUID } from 'crypto'
+import { randomInt } from 'crypto'
 import { execFile, exec, spawn } from 'child_process'
+import { WebSocketServer } from 'ws'
 import { promisify } from 'util'
 
 const execFileP = promisify(execFile)
@@ -734,6 +736,164 @@ loadThumbs()
 </html>`
 
 // ---------------------------------------------------------------
+// 配对状态（内存存储，进程级）
+// ---------------------------------------------------------------
+const CODE_VALIDITY_MS = 5 * 60 * 1000  // 5 分钟
+
+let pairingState = {
+  code: null,
+  expiresAt: 0,
+  computerWs: null,  // { ws, ip }
+  phoneWs: null,     // { ws, ip }
+}
+
+function generateCode() {
+  return String(randomInt(0, 1_000_000)).padStart(6, '0')
+}
+
+function clearPairing(keepComputer = false) {
+  if (pairingState.computerWs) {
+    try { pairingState.computerWs.ws.close(4000, 'pairing_cleared') } catch {}
+    if (!keepComputer) pairingState.computerWs = null
+  }
+  if (pairingState.phoneWs) {
+    try { pairingState.phoneWs.ws.close(4000, 'pairing_cleared') } catch {}
+    pairingState.phoneWs = null
+  }
+  if (!keepComputer) {
+    pairingState.code = null
+    pairingState.expiresAt = 0
+  }
+}
+
+// WebSocket 服务器（挂在主 HTTPS server 上，通过 upgrade 事件接入）
+let wss = null
+
+function setupWss(server) {
+  wss = new WebSocketServer({ noServer: true })
+
+  wss.on('connection', (ws, request) => {
+    const url = new URL(request.url, `https://${request.headers.host}`)
+    const role = url.searchParams.get('role')
+    const code = url.searchParams.get('code')
+    const ip = request.socket.remoteAddress
+
+    // 校验 code 格式
+    if (!code || !/^\d{6}$/.test(code)) {
+      ws.close(4003, 'invalid_code')
+      return
+    }
+    // 校验 code 一致性和有效期
+    if (pairingState.code !== code) {
+      ws.close(4001, 'invalid_code')
+      return
+    }
+    if (Date.now() > pairingState.expiresAt) {
+      ws.close(4002, 'code_expired')
+      return
+    }
+
+    if (role === 'computer') {
+      if (pairingState.computerWs) {
+        ws.close(4003, 'already_paired')
+        return
+      }
+      pairingState.computerWs = { ws, ip }
+      console.log(`[配对] 电脑已连接: ${ip}`)
+      // 若手机已在线，通知电脑
+      if (pairingState.phoneWs) {
+        pairingState.computerWs.ws.send(JSON.stringify({ type: 'PHONE_PAIRED', phoneIp: pairingState.phoneWs.ip }))
+      }
+    } else {
+      // role === 'phone'（默认其他 role 也当 phone 处理）
+      if (pairingState.phoneWs) {
+        ws.close(4003, 'already_paired')
+        return
+      }
+      pairingState.phoneWs = { ws, ip }
+      console.log(`[配对] 手机已连接: ${ip}`)
+      // 通知电脑
+      if (pairingState.computerWs) {
+        pairingState.computerWs.ws.send(JSON.stringify({ type: 'PHONE_PAIRED', phoneIp: ip }))
+      }
+    }
+
+    ws.on('message', (data) => {
+      let msg
+      try { msg = JSON.parse(data) } catch { return }
+      if (msg.type === 'PUSH_RECORD' && pairingState.computerWs) {
+        pairingState.computerWs.ws.send(JSON.stringify({ type: 'SCAN_RECORD', record: msg.record }))
+      }
+      if (msg.type === 'END_SESSION') {
+        clearPairing(false)
+      }
+    })
+
+    ws.on('close', () => {
+      if (role === 'computer') {
+        console.log(`[配对] 电脑断开: ${ip}`)
+        if (pairingState.phoneWs) {
+          pairingState.phoneWs.ws.send(JSON.stringify({ type: 'SESSION_ENDED', reason: 'computer_disconnected' }))
+        }
+        clearPairing(false)
+      } else {
+        console.log(`[配对] 手机断开: ${ip}`)
+        pairingState.phoneWs = null
+        if (pairingState.computerWs) {
+          pairingState.computerWs.ws.send(JSON.stringify({ type: 'PHONE_DISCONNECTED' }))
+        }
+      }
+    })
+
+    ws.on('error', (err) => {
+      console.warn(`[配对] WS 错误: ${err.message}`)
+    })
+  })
+
+  // 将 /pairing/join 路径的 upgrade 请求路由到 WebSocket 服务器
+  server.on('upgrade', (request, socket, head) => {
+    const url = new URL(request.url, `https://${request.headers.host}`)
+    if (url.pathname === '/pairing/join') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request)
+      })
+    }
+  })
+}
+
+// ---------------------------------------------------------------
+// 配对 REST 端点
+// ---------------------------------------------------------------
+app.post('/pairing/generate', (_req, res) => {
+  const code = generateCode()
+  pairingState.code = code
+  pairingState.expiresAt = Date.now() + CODE_VALIDITY_MS
+  // 清除旧的 WS 连接（保留 server WS）
+  clearPairing(true)
+  const serverUrl = `https://${getLocalIp()}:${PORT}`
+  const qrPayload = `snrecog://pair?code=${code}&server=${encodeURIComponent(serverUrl)}`
+  console.log(`[配对] 生成配对码: ${code}`)
+  res.json({ code, expiresAt: pairingState.expiresAt, serverUrl, qrPayload })
+})
+
+app.get('/pairing/status', (_req, res) => {
+  if (!pairingState.code || Date.now() > pairingState.expiresAt) {
+    return res.json({ hasActivePairing: false })
+  }
+  res.json({
+    hasActivePairing: true,
+    pairedDevice: pairingState.phoneWs ? 'phone' : (pairingState.computerWs ? 'computer' : null),
+    connectedAt: pairingState.expiresAt - CODE_VALIDITY_MS,
+  })
+})
+
+app.delete('/pairing/end', (_req, res) => {
+  clearPairing(false)
+  console.log('[配对] 会话已结束')
+  res.json({ ok: true })
+})
+
+// ---------------------------------------------------------------
 // 启动
 // ---------------------------------------------------------------
 const localIp = getLocalIp()
@@ -742,11 +902,14 @@ const sslOptions = {
   cert: readFileSync(join(import.meta.dirname, 'cert.pem')),
 }
 
-createHttpsServer(sslOptions, app).listen(PORT, '0.0.0.0', () => {
+const server = createHttpsServer(sslOptions, app)
+setupWss(server)
+server.listen(PORT, '0.0.0.0', () => {
   console.log('\n===========================================')
   console.log('  OCR 中转服务 v5 已启动（ HTTPS ）')
   console.log(`  OCR 接口:   https://${localIp}:${PORT}/ocr`)
   console.log(`  调试页面:   https://${localIp}:${PORT}/debug`)
+  console.log(`  配对服务:   wss://${localIp}:${PORT}/pairing/join`)
   console.log(`  调试目录:   ${DEBUG_DIR}`)
   console.log('===========================================\n')
 })
