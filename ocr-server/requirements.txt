@@ -1,0 +1,5 @@
+# OCR sidecar 依赖（跨平台，纯 CPU，离线）
+# 部署：python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+rapidocr-onnxruntime>=1.3
+opencv-python-headless
+numpy

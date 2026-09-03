@@ -1,0 +1,15 @@
+{
+  "name": "sn-ocr-server",
+  "version": "1.0.0",
+  "description": "OCR中转服务 - 接收手机端帧图片，返回OCR识别结果",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "canvas": "^2.11.2",
+    "tesseract.js": "^7.0.0"
+  }
+}
