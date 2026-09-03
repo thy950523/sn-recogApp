@@ -10,6 +10,7 @@ PID_DIR="$SCRIPT_DIR/.pids"
 mkdir -p "$PID_DIR"
 
 FRONTEND_PID_FILE="$PID_DIR/frontend.pid"
+OCR_SERVER_PID_FILE="$PID_DIR/ocr-server.pid"
 PY_PID_FILE="$PID_DIR/python.pid"
 
 # 颜色
@@ -64,6 +65,29 @@ start_frontend() {
 }
 
 # ----------------------------------------------------------
+# 启动 OCR 中转服务（Node.js HTTPS，包含配对 WebSocket）
+# ----------------------------------------------------------
+start_ocr_server() {
+  if [ -f "$OCR_SERVER_PID_FILE" ] && is_alive "$(cat "$OCR_SERVER_PID_FILE")" 2>/dev/null; then
+    warn "OCR 中转服务已在运行 (PID=$(cat $OCR_SERVER_PID_FILE))"
+  elif is_port_used 3456; then
+    warn "端口 3456 被占用，OCR 中转服务可能已在运行"
+  else
+    log "启动 OCR 中转服务 (Node.js HTTPS :3456)..."
+    cd "$SCRIPT_DIR/ocr-server"
+    node server.js > /dev/null 2>&1 &
+    echo $! > "$OCR_SERVER_PID_FILE"
+    sleep 3
+    if is_port_used 3456; then
+      log "OCR 中转服务启动成功 (PID=$(cat $OCR_SERVER_PID_FILE))"
+    else
+      warn "OCR 中转服务启动延迟，等待中..."
+      sleep 5
+    fi
+  fi
+}
+
+# ----------------------------------------------------------
 # 启动 Python OCR 引擎（RapidOCR）
 # Vite proxy /ocr/ → :3458，无需 Node 中转层
 # ----------------------------------------------------------
@@ -98,6 +122,7 @@ main() {
   echo ""
 
   start_frontend
+  start_ocr_server
   start_python_ocr
 
   echo ""
@@ -111,6 +136,12 @@ main() {
     err "前端:       :3000 ❌ 未运行"
   fi
 
+  if is_port_used 3456; then
+    log "OCR 中转服务: :3456 ✅ (HTTPS + WebSocket)"
+  else
+    err "OCR 中转服务: :3456 ❌ 未运行"
+  fi
+
   if is_port_used 3458; then
     log "Python OCR  :3458 ✅ (RapidOCR)"
   else
@@ -120,6 +151,7 @@ main() {
   echo ""
   log "访问地址: https://localhost:3000"
   log "（移动端访问: https://<本机IP>:3000）"
+  log "配对入口:   https://localhost:3000/desktop"
   log "OCR 通过 Vite proxy 自动代理，无需单独开放端口"
   echo ""
 }
