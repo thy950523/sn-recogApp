@@ -3,7 +3,7 @@ import type { ContinuousScanRecord, SnRecord } from '@/types'
 
 const KEY = 'sn-scanner-records-v1'
 
-function load(): SnRecord[] {
+function load(): (SnRecord | ContinuousScanRecord)[] {
   try {
     const raw = localStorage.getItem(KEY)
     if (!raw) return []
@@ -74,11 +74,11 @@ export function useRecords() {
             ocrNote: patch.note ?? null,
             verified: patch.consistent,
             verifyStatus,
-            imei: patch.imei ?? r.imei ?? null,
-            imei2: patch.imei2 ?? r.imei2 ?? null,
-            meid: patch.meid ?? r.meid ?? null,
-            eid: patch.eid ?? r.eid ?? null,
-            rawOcr: patch.rawOcr ?? r.rawOcr ?? null,
+            imei: patch.imei ?? (r as ContinuousScanRecord).imei ?? null,
+            imei2: patch.imei2 ?? (r as ContinuousScanRecord).imei2 ?? null,
+            meid: patch.meid ?? (r as ContinuousScanRecord).meid ?? null,
+            eid: patch.eid ?? (r as ContinuousScanRecord).eid ?? null,
+            rawOcr: patch.rawOcr ?? (r as ContinuousScanRecord).rawOcr ?? null,
           } as ContinuousScanRecord
         }),
       )

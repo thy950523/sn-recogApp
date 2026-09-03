@@ -330,8 +330,6 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
           rawOcr: text || null,
         })
       })()
-    } else {
-      updateRecordOcr(recordId, { ocr: null, consistent: false })
     }
 
     setMatchedBarcode(null)
