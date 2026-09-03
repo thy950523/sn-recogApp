@@ -285,7 +285,7 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
     }
 
     engine.setCallback({ onBarcodeDetected })
-  }, [barcodeList, records])
+  }, [barcodeList, records, serverUrl])
 
   // ---------------------------------------------------------------
   // 登记逻辑
@@ -319,7 +319,7 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
         const { text } = await runOcr(canvas, serverUrl)
         const f = extractDeviceFields(text ?? '', barcodes)
         const ocrSn = f.sn?.value ?? extractSnCandidates(text ?? '')[0] ?? null
-        const found = ocrSn ? (barcodes.find(b => b === ocrSn) ?? null) : null
+        const found = ocrSn ? (barcodes.find(b => ocrSn === b) ?? null) : null
         updateRecordOcr(recordId, {
           ocr: ocrSn,
           consistent: found !== null,
@@ -365,7 +365,7 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
     if (sn) {
       engineRef.current?.stopCooldown(sn)
     }
-  }, [])
+  }, [matchedBarcode])
 
   // 一键复制：SN / IMEI1 / IMEI2 / EID / 条形码
   const handleCopy = useCallback(async () => {
