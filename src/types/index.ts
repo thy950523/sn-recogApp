@@ -74,3 +74,26 @@ export interface ContinuousScanRecord extends SnRecord {
   /** OCR 备注（如噪声字符混入说明） */
   ocrNote: string | null
 }
+
+// ---------------------------------------------------------------
+// 配对 / WebSocket 消息类型
+// ---------------------------------------------------------------
+
+export type WsMessageType =
+  | 'SCAN_RECORD'
+  | 'PUSH_RECORD'
+  | 'END_SESSION'
+  | 'SESSION_ENDED'
+  | 'PHONE_PAIRED'
+  | 'PHONE_DISCONNECTED'
+  | 'PING'
+  | 'PONG'
+  | 'ERROR'
+
+export interface WsMessage {
+  type: WsMessageType
+  record?: ContinuousScanRecord
+  reason?: string
+  phoneIp?: string
+  message?: string
+}
