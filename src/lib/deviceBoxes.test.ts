@@ -31,9 +31,13 @@ describe('assignByNearestY', () => {
     expect(assignByNearestY(items, anchors, 0.3)).toEqual([0, 1, 1])
   })
 
-  it('超出 maxDistance 的条目标为 -1', () => {
-    const anchors = [anchor(0.1, 0.2)]
-    expect(assignByNearestY([{ box: anchor(0.9, 0.95) }], anchors, 0.2)).toEqual([-1])
+  it('恰好等于 maxDistance 时保留，超出标为 -1', () => {
+    const anchors = [anchor(0.25, 0.25)]
+    const items = [
+      { box: anchor(0.5, 0.5) }, // 距离 0.25 == maxDistance → 保留
+      { box: anchor(0.75, 0.75) }, // 距离 0.5 > maxDistance → -1
+    ]
+    expect(assignByNearestY(items, anchors, 0.25)).toEqual([0, -1])
   })
 
   it('没有锚点时全部返回 -1', () => {
@@ -41,8 +45,8 @@ describe('assignByNearestY', () => {
   })
 
   it('等距时取靠上的锚点（结果稳定可预测）', () => {
-    const anchors = [anchor(0.2, 0.3), anchor(0.4, 0.5)]
-    expect(assignByNearestY([{ box: anchor(0.34, 0.36) }], anchors, 1)).toEqual([0])
+    const anchors = [anchor(0.25, 0.25), anchor(0.75, 0.75)] // 中心 0.25 / 0.75
+    expect(assignByNearestY([{ box: anchor(0.5, 0.5) }], anchors, 1)).toEqual([0])
   })
 })
 

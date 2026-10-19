@@ -35,7 +35,8 @@ export function boxCenterY(box: Box4): number {
 /**
  * 按 y 轴就近把条目分配到锚点。
  * 返回与 items 等长的数组，元素为锚点下标；超出 maxDistance 或无锚点时返回 -1。
- * 等距时取下标较小的锚点（即靠上的），保证结果稳定。
+ * 等距时取下标较小的锚点，保证结果稳定。
+ * 前提：anchors 按中心 y 升序传入时，「下标较小」才等价于「几何上靠上」。
  */
 export function assignByNearestY(
   items: BoxedItem[],
