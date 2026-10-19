@@ -2237,6 +2237,38 @@ git commit -m "feat(image): 拍照后压缩存入 IndexedDB，登记记录关联
 
 **Files:**
 - Modify: `src/sections/RecordsView.tsx`
+- Modify: `src/pages/Home.tsx`
+
+**Step 0: 清空记录时连图片库一起清（重要）**
+
+按用户选择「所有拍照都存」，**重拍但未登记**的照片也会进 IndexedDB，且没有任何记录引用它们。
+`useRecords` 的删图 effect 只能删「记录不再引用」的图，碰不到这些孤儿，
+于是清空记录后 `images` 表仍有残留 —— 与验收标准 5「清空后 images 表应为空」冲突。
+
+`src/pages/Home.tsx`：导入 `clearAll`，并把传给 `RecordsView` 的 `onClear` 换掉：
+
+```tsx
+import { clearAll, saveCanvasImage } from '@/lib/imageStore'
+```
+
+```tsx
+  // 清空记录同时清空图片库：孤儿照片（重拍未登记的）没有记录引用，
+  // 只靠删记录联动是删不掉的
+  const handleClear = useCallback(() => {
+    clear()
+    void clearAll().catch((e) => console.warn('[image] 清空图片失败:', e))
+  }, [clear])
+```
+
+```tsx
+    return <RecordsView records={records} onBack={backToScan} onRemove={remove} onClear={handleClear} />
+```
+
+同时把 `RecordsView` 里清空确认按钮的文案改成提示会一并删图：
+
+```tsx
+              确认清空记录与照片？
+```
 
 **Step 1: 加缩略图组件**
 
@@ -2356,8 +2388,8 @@ Expected: 无错误。
 **Step 6: Commit**
 
 ```bash
-git add src/sections/RecordsView.tsx
-git commit -m "feat(ui): 记录页显示缩略图与图片占用"
+git add src/sections/RecordsView.tsx src/pages/Home.tsx
+git commit -m "feat(ui): 记录页显示缩略图与图片占用，清空时连图片库一起清"
 ```
 
 ---
