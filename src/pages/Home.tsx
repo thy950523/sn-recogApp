@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import ScanView from '@/sections/ScanView'
 import MultiResultView from '@/sections/MultiResultView'
 import type { ImagePayload } from '@/sections/MultiResultView'
@@ -59,12 +59,17 @@ export default function Home() {
         img.onerror = () => reject(new Error('图片解码失败'))
         img.src = image.dataUrl
       })
+      // 不用非空断言 `getContext('2d')!`：它抛出的 TypeError 没有上下文，
+      // catch 里 warn 出来只是个光秃秃的 TypeError，看不出「为什么失败」。
+      // 显式检查并抛说明性错误，行为等价（原本也会抛、也被同一个 catch 接住）。
+      const ctx = canvas.getContext('2d')
+      if (!ctx) throw new Error('无法创建画布上下文')
       // 显式给出目标宽高，不要写成 drawImage(img, 0, 0)。
       // 眼下两者恰好相等（dataUrl 正是从 image.width×image.height 的画布导出的，
       // 解码回来还是同样大小），所以 drawImage(img,0,0) 现在是 1:1 拷贝、看不出问题。
       // 但一旦哪天载荷改成传原图 dataUrl，drawImage(img,0,0) 会按**原图**尺寸绘制、
       // 超出画布的部分被静默裁掉 —— 存下来的是照片左上角一块，且不报错。
-      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height)
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
       imageId = await saveCanvasImage(canvas)
     } catch (e) {
       console.warn('[image] 保存失败，本次登记将不带图片:', e)
@@ -88,6 +93,17 @@ export default function Home() {
   const openRecords = useCallback(() => setScreen({ name: 'records' }), [])
   const backToScan = useCallback(() => setScreen({ name: 'scan' }), [])
 
+  // 安全网：任何离开识别页的路径都自动释放锁。
+  // 上面 handleRegister / handleRetake 里的显式释放仍是主机制 —— 它们在 setScreen 之前
+  // 同步执行，时机更紧（不留任何「锁已松但界面还没切走」的窗口）。
+  // 这里只是兜底：将来若有人给 multi 屏加了第三条出口却忘了释放，相机不会因此永久静默失效。
+  //
+  // 不会提前松锁：multi 屏期间 screen.name === 'multi'，条件为假，本 effect 不释放；
+  // 只有 screen.name 真正切走（不再是 'multi'）的那次渲染后才释放。
+  useEffect(() => {
+    if (screen.name !== 'multi') savingRef.current = false
+  }, [screen.name])
+
   if (screen.name === 'records') {
     return <RecordsView records={records} onBack={backToScan} onRemove={remove} onClear={clear} />
   }
@@ -103,6 +119,7 @@ export default function Home() {
         onRetake={handleRetake}
         onRegister={handleRegister}
         imageId={screen.imageId}
+        imageSaveFailed={screen.imageId === null}
       />
     )
   }

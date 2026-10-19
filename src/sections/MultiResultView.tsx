@@ -20,6 +20,12 @@ interface Props {
   onRegister: (list: Omit<SnRecord, 'id' | 'time'>[]) => void
   /** 图片存入 IndexedDB 后的 imageId（登记时写入每条记录） */
   imageId: string | null
+  /**
+   * 存图失败（配额满等）时为 true：此时 imageId 为 null，登记的记录不会带图。
+   * 失败不中断流程（照样能识别、能登记），但必须在界面上看得见，不能静默。
+   * 可选：不传时行为与从前完全一致（不渲染任何提示）。
+   */
+  imageSaveFailed?: boolean
 }
 
 /** 把归一化 Box4 转成绝对定位样式 */
@@ -37,7 +43,14 @@ function badgeStyle(box: Box4): CSSProperties {
   return { left: `${box[0] * 100}%`, top: `${box[1] * 100}%` }
 }
 
-export default function MultiResultView({ image, existingSns, onRetake, onRegister, imageId }: Props) {
+export default function MultiResultView({
+  image,
+  existingSns,
+  onRetake,
+  onRegister,
+  imageId,
+  imageSaveFailed,
+}: Props) {
   const [stage, setStage] = useState('准备识别…')
   const [result, setResult] = useState<MultiRecognizeResult | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
@@ -226,6 +239,16 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
           重拍
         </button>
       </header>
+
+      {/* 存图失败的非阻塞提示：放在页头下方、标注层之上，识别中/失败时也始终可见。
+          存图失败不中断流程（记录照样能登记），但若只 console.warn，用户会以为照片
+          存上了、实则没有，且当场无法察觉 —— 正是本项目最忌讳的静默失败。
+          样式与页内既有提示（result.error 那条）保持一致。 */}
+      {imageSaveFailed && (
+        <div className="mx-4 mb-3 border border-[#ffc700]/50 bg-[#ffc700]/10 px-3 py-2 font-mono text-[11px] text-[#ffc700]">
+          ⚠ 本次照片未能保存到本机，登记的记录将不带图片；如需留图请重拍一次。
+        </div>
+      )}
 
       {/* 原图 + 标注层 */}
       <div className="relative mx-4 border border-[#1f1f1f] bg-[#0a0a0a]">
