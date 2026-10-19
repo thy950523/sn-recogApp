@@ -1,7 +1,5 @@
 export type VerifyStatus = 'match' | 'mismatch' | 'barcode_only' | 'ocr_only' | 'none' | 'pending'
 
-export type ScanMode = 'scan' | 'result' | 'records' | 'continuous'
-
 /** 一个 OCR 提取到的设备标识及其条码匹配结果 */
 export interface MatchedField {
   value: string
