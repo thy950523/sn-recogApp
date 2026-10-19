@@ -26,6 +26,27 @@ export function droppedImageIds(prev: Iterable<string>, current: Iterable<string
   return [...new Set(prev)].filter((id) => !cur.has(id))
 }
 
+/**
+ * 把「无 id / time 的待登记记录」批量补全为完整 SnRecord。
+ *
+ * 抽成纯函数是为了能测：这段映射决定「什么被写进数据库」，而批量写入最容易
+ * 写错的一点是 **id 的生成方式** —— 同一次 addMany 里所有记录共用同一个 `now`，
+ * 若 id 只用 `now` 而不带批内下标 `i`，同毫秒批量写入的多条记录会撞成同一个 id，
+ * 后续按 id 删除/更新就会一次误伤多条。这里 id 同时用 `now` 与 `i`，保证批内互不相同。
+ *
+ * 「当前时间」作为参数注入（默认 `Date.now()`），使函数无隐藏时钟、可确定性地测。
+ */
+export function buildManyRecords(
+  list: Omit<SnRecord, 'id' | 'time'>[],
+  now: number = Date.now(),
+): SnRecord[] {
+  return list.map((r, i) => ({
+    ...r,
+    id: `${now}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+    time: now,
+  }))
+}
+
 export function useRecords() {
   const [records, setRecords] = useState<(SnRecord | ContinuousScanRecord)[]>(load)
 
@@ -61,12 +82,8 @@ export function useRecords() {
   /** 批量登记：一次 setState 写入多条，返回新建记录的 id 列表 */
   const addMany = useCallback((list: Omit<SnRecord, 'id' | 'time'>[]): string[] => {
     if (!list.length) return []
-    const now = Date.now()
-    const created = list.map((r, i) => ({
-      ...r,
-      id: `${now}-${i}-${Math.random().toString(36).slice(2, 8)}`,
-      time: now,
-    }))
+    // 记录构造抽成纯函数 buildManyRecords（见其定义处注释），这里只负责一次写入 + 回传 id
+    const created = buildManyRecords(list)
     setRecords((prev) => [...prev, ...created])
     return created.map((r) => r.id)
   }, [])
