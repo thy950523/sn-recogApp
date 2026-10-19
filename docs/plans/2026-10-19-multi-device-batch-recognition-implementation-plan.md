@@ -20,6 +20,20 @@
 - 类型导入用 `import type`（`verbatimModuleSyntax` 已开启）。
 - 测试文件与源文件同目录：`src/lib/xxx.test.ts`。
 - 每个 Task 结束都要 commit。
+- **包管理器用 pnpm**（`node_modules` 是 pnpm 布局，npm 会破坏它）。`pnpm-lock.yaml` 与
+  `package-lock.json` 历史上都被跟踪，属既有混乱，本次只更新 `pnpm-lock.yaml`。
+
+---
+
+## 前置修复（已在执行前完成）
+
+`src/lib/recognize.ts` 存在一个既有 bug：`recognizeSn()` 内的 `runOcr` 闭包引用了
+嵌套 `if` 块中声明的 `worker`，闭包作用域链上不可见 —— 运行时抛 `ReferenceError`，
+且被四处空 `catch` 静默吞掉，导致**服务端 OCR 不可用时的本地 Tesseract 兜底完全失效**。
+它同时让 `npx tsc -b` 报 3 个错、`npm run build` 跑不过。
+
+已修复（commit `ed4194b`）：`worker` 改为 `runOcr` 的形参传入，四处空 catch 改为打日志。
+控制流与 fallback 顺序未动。**Task 7 的降级路径依赖这个修复**。
 
 ---
 
