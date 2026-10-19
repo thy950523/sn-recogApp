@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { buildCandidates, snFromLine, type OcrLine } from './multiRecognize'
+import {
+  buildCandidates,
+  markUnverified,
+  snFromLine,
+  type DeviceCandidate,
+  type OcrLine,
+} from './multiRecognize'
 import type { Box4 } from './deviceBoxes'
 
 /** 造一行 OCR 文本：y0/y1 为归一化纵向范围 */
@@ -215,5 +221,48 @@ describe('buildCandidates', () => {
 
   it('什么都识别不到时返回空数组', () => {
     expect(buildCandidates([], [])).toEqual([])
+  })
+})
+
+describe('markUnverified', () => {
+  const cand = (over: Partial<DeviceCandidate>): DeviceCandidate => ({
+    sn: '8A7C2D1E',
+    barcode: null,
+    barcodes: [],
+    imei: null,
+    imei2: null,
+    meid: null,
+    eid: null,
+    rawOcr: '',
+    status: 'ocr_only',
+    note: null,
+    snBox: [0.1, 0.1, 0.9, 0.14],
+    barcodeBoxes: [],
+    ...over,
+  })
+
+  it('锚点类候选降为 pending 并清空 snBox（合成坐标不能画框）', () => {
+    const out = markUnverified([
+      cand({ status: 'match', barcode: '8A7C2D1E' }),
+      cand({ status: 'mismatch' }),
+      cand({ status: 'ocr_only' }),
+    ])
+    // 降级后不能再出现 match/mismatch —— 否则一张好照片会被标成「与条码不一致」，
+    // 用户会据此丢掉正确数据
+    expect(out.map((d) => d.status)).toEqual(['pending', 'pending', 'pending'])
+    expect(out.every((d) => d.snBox === null)).toBe(true)
+    expect(out[0].note).toContain('人工核对')
+  })
+
+  it('barcode_only 保持原样：条码位置是真实检测到的，不涉及合成坐标', () => {
+    const b = cand({
+      sn: '9B8D3E2F',
+      status: 'barcode_only',
+      barcode: '9B8D3E2F',
+      snBox: null,
+      barcodeBoxes: [[0.1, 0.88, 0.9, 0.92]],
+      note: '未读到 S/N 文字，仅有条码',
+    })
+    expect(markUnverified([b])).toEqual([b])
   })
 })

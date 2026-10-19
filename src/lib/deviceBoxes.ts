@@ -64,8 +64,9 @@ export function pointToBoxDistance(px: number, py: number, box: Box4): number {
  * 等距时取下标较小的锚点，保证结果稳定。
  * 前提：anchors 按中心 y 升序传入时，「下标较小」才等价于「几何上靠上」。
  *
- * maxDistance 传 Infinity 表示「不设上限、最近者得」——用于 OCR 文字行：
- * 丢掉一行等于静默丢失一个 IMEI，比归错（界面上可见、可改）更糟。
+ * maxDistance 传 Infinity 表示「不设上限、最近者得」——用于 OCR 文字行。
+ * 这是两害相权的选择，理由见 multiRecognize.buildCandidates 第 2 段的注释：
+ * 文字行设上限会静默丢弃 IMEI/EID，不设上限会让远处背景行被吸进来且**不报警**。
  */
 export function assignNearest(
   items: BoxedItem[],

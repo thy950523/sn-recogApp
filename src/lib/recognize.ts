@@ -12,6 +12,7 @@ import {
 
 // 归一化 / S/N 标记提取 / 候选提取已迁至 deviceFields.ts，此处转出保持现有引用可用
 export { normalizeSn, extractSnByMarker, extractSnCandidates }
+export { PSM }
 
 setZXingModuleOverrides({
   locateFile: (path: string) => (path.endsWith('.wasm') ? zxingWasmUrl : path),
@@ -277,6 +278,14 @@ async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
     if (found.size >= 3) break
   }
   return sortHits(found)
+}
+
+/** 扫描整图中的全部条码（含像素坐标），供一图多码流程复用 */
+export async function scanBarcodes(
+  canvas: HTMLCanvasElement,
+): Promise<{ value: string; box: { x: number; y: number; w: number; h: number } }[]> {
+  const hits = await decodeAllBarcodes(canvas)
+  return hits.map((h) => ({ value: h.value, box: h.box }))
 }
 
 function sortHits(found: Map<string, BarHit>): BarHit[] {

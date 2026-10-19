@@ -16,7 +16,7 @@ import {
   extractSnCandidates,
   NON_SN_LABEL,
 } from './deviceFields'
-import { assignNearest, boxCenterY, type Box4 } from './deviceBoxes'
+import { assignNearest, boxCenterY, normalizeBox, type Box4 } from './deviceBoxes'
 import type { VerifyStatus } from '@/types'
 
 /** OCR 返回的一行文字及其归一化坐标 */
@@ -104,9 +104,18 @@ export function buildCandidates(
   // ---- 2. 条码归到最近的锚点；无锚点时每个条码自成一条 ----
   const barcodeOwner = assignNearest(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
   // 行归属：同样按二维就近归到锚点（锚点自身距离为 0，必然归给自己）。
-  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**：
-  // 一行没归到任何设备 = 静默丢掉一个 IMEI/EID，比归错（界面上看得见、能改）更糟。
-  // 条码则相反：画面里可能有不属于任何设备的条码（包装箱上的码），所以要设上限。
+  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**。这是两害相权，没有哪个常数
+  // 能把两种失败分开：
+  //   · 设上限：超限的 IMEI/EID 被丢弃 → 字段空着（看得见），但大设备占满画面、
+  //     IMEI 行离 SN 行 0.4 以上时会被误丢（实测复现）。
+  //   · 不设上限：远处背景行（包装箱/邻机上的另一个 IMEI 标签）被吸进来 → 字段填错，
+  //     而且**不报警**：status 由「条码 vs SN」算出，吸错 IMEI 不会让它变 mismatch，
+  //     候选照样是 match。这与「归错在界面上看得见」的直觉相反，是实测结论。
+  // 选 Infinity：设个 0.5 之类的上限并不能可靠挡住背景行（它可能就在 0.4 处），
+  // 却会重新引入丢弃 —— 花了丢弃的代价，没买到防串台的收益。
+  // 剩下的真歧义（某个不属于本设备的标签，离本设备比离其他设备都近）任何距离规则
+  // 都判不出来，只能靠人工核对。条码不同：有 zxing 的真实坐标、且画面里常有与设备
+  // 无关的码，所以要设上限。
   const lineOwner = assignNearest(lines, anchorBoxes, Infinity)
 
   // 未被任何锚点认领、但值与某个锚点 SN 相同的条码：直接归给那个锚点。
@@ -215,4 +224,204 @@ export function buildCandidates(
   const sortY = (d: DeviceCandidate) =>
     d.snBox ? boxCenterY(d.snBox) : d.barcodeBoxes[0] ? boxCenterY(d.barcodeBoxes[0]) : 1
   return devices.sort((a, b) => sortY(a) - sortY(b))
+}
+
+// ---------------------------------------------------------------
+// 主入口：接 zxing 条码 + 服务端 RapidOCR
+// ---------------------------------------------------------------
+
+export interface MultiRecognizeResult {
+  devices: DeviceCandidate[]
+  /** 整图 OCR 原文，供人工核对 */
+  rawText: string
+  engine: 'rapidocr' | 'tesseract' | 'none'
+  /** true = 服务器不可用已降级（无坐标，不画框） */
+  degraded: boolean
+  error: string | null
+}
+
+/** 服务端 OCR 返回体 */
+interface ServerOcrResponse {
+  engine?: string
+  text?: string
+  lines?: { text: string; conf: number; box: number[] }[]
+}
+
+/** 把 canvas 缩到最长边 maxEdge，减少上传体积 */
+function scaleForUpload(canvas: HTMLCanvasElement, maxEdge: number): HTMLCanvasElement {
+  const longest = Math.max(canvas.width, canvas.height)
+  if (longest <= maxEdge) return canvas
+  const scale = maxEdge / longest
+  const out = document.createElement('canvas')
+  out.width = Math.round(canvas.width * scale)
+  out.height = Math.round(canvas.height * scale)
+  const ctx = out.getContext('2d')!
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(canvas, 0, 0, out.width, out.height)
+  return out
+}
+
+/** 调用服务端 OCR，失败返回 null（由调用方降级） */
+async function callServerOcr(
+  canvas: HTMLCanvasElement,
+  serverUrl: string,
+  timeoutMs = 20000,
+): Promise<ServerOcrResponse | null> {
+  if (!serverUrl) return null
+  const upload = scaleForUpload(canvas, 1600)
+  try {
+    const blob = await new Promise<Blob | null>((resolve) =>
+      upload.toBlob(resolve, 'image/jpeg', 0.9),
+    )
+    if (!blob) return null
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(`${serverUrl}/ocr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'image/jpeg', 'X-Ocr-Id': `multi-${Date.now()}` },
+        body: blob,
+        signal: controller.signal,
+      })
+      if (!res.ok) return null
+      return (await res.json()) as ServerOcrResponse
+    } finally {
+      // 放在 finally：fetch 抛错（断网/中止）时也要清掉，否则定时器会挂到超时
+      clearTimeout(timer)
+    }
+  } catch {
+    return null
+  }
+}
+
+// 这里没有复用 recognize.ts 里已有的 runServerOcr，原因有二，都是硬约束：
+//   1. multiRecognize.ts 不能静态 import './recognize'（它顶层加载 tesseract.js 与 zxing-wasm，
+//      会打断 Node 单测）；把 runServerOcr 搬出来又要新建模块、改动核心识别文件，风险大于收益。
+//   2. 两者需求不同：recognizeSn 要把整图按 0.92 质量原样上传（标签字小，不能再降采样）；
+//      一图多码是整张照片，必须缩到 1600px 再传，否则体积和耗时都不可接受。
+// 因此这是**有意重复**，不是漏改。若日后要合并，先给 runServerOcr 加上「是否降采样」参数。
+
+/**
+ * 降级模式：OCR 没给出坐标，条码与 S/N 的配对是按合成坐标算的，几何上不可信。
+ *
+ * 把锚点类候选（match / mismatch / ocr_only）一律改为 `pending`（待人工确认），
+ * 否则一张好照片会因为配对错位被标成「⚠ 与条码不一致」——那是在误导用户丢弃正确数据。
+ * `barcode_only` 保持原样：它的 SN 直接来自 zxing 在原图上真实读到的条码，
+ * 位置也是真实的，不涉及合成坐标，标成「仅条码」比「待人工确认」信息量更大。
+ *
+ * `snBox` 同时置空：合成坐标绝不能拿去画框。
+ */
+export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
+  return devices.map((d) =>
+    d.status === 'barcode_only'
+      ? d
+      : {
+          ...d,
+          status: 'pending' as VerifyStatus,
+          note: 'OCR 未返回文字坐标，设备配对未经位置校验，请人工核对',
+          snBox: null,
+        },
+  )
+}
+
+/**
+ * 一图多码识别主入口。
+ *
+ * @param canvas 原始照片画布（像素坐标）
+ * @param serverUrl OCR 服务地址（通常传 window.location.origin，走 Vite 代理）
+ */
+export async function recognizeMulti(
+  canvas: HTMLCanvasElement,
+  serverUrl: string,
+  onStage?: (stage: string) => void,
+): Promise<MultiRecognizeResult> {
+  const imgW = canvas.width
+  const imgH = canvas.height
+
+  // ---- 1. 条码（本地 zxing，始终可用）----
+  onStage?.('扫描全部条形码…')
+  const { scanBarcodes } = await import('./recognize')
+  const rawBarcodes = await scanBarcodes(canvas)
+  const barcodes: DetectedBarcode[] = rawBarcodes.map((b) => ({
+    value: b.value,
+    box: normalizeBox(b.box, imgW, imgH),
+  }))
+
+  // ---- 2. OCR（服务端 RapidOCR，带坐标）----
+  onStage?.('正在识别文字…')
+  const server = await callServerOcr(canvas, serverUrl)
+
+  if (server && typeof server.text === 'string') {
+    const lines: OcrLine[] = (server.lines ?? [])
+      .filter((l) => l && typeof l.text === 'string' && Array.isArray(l.box) && l.box.length === 4)
+      .map((l) => ({
+        text: l.text,
+        conf: typeof l.conf === 'number' ? l.conf : 0,
+        box: [l.box[0], l.box[1], l.box[2], l.box[3]] as Box4,
+      }))
+
+    if (lines.length) {
+      return {
+        devices: buildCandidates(lines, barcodes),
+        rawText: server.text,
+        engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
+        degraded: false,
+        error: null,
+      }
+    }
+
+    // 服务器有文本但没有坐标（如中转层的 Tesseract 分支）：
+    // 不能因为没坐标就把这段 OCR 文本丢掉，否则 SN/IMEI 信息全没了。
+    // 合成坐标只用于按顺序归组；markUnverified 会置空 snBox（不画框）
+    // 并把锚点类候选降为 pending —— 合成坐标算出的配对不可信。
+    const synth: OcrLine[] = server.text
+      .split(/\r?\n/)
+      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
+    return {
+      devices: markUnverified(buildCandidates(synth, barcodes)),
+      rawText: server.text,
+      engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
+      degraded: true,
+      error: 'OCR 未返回文字坐标，已按文本识别，但无法在原图上标注位置',
+    }
+  }
+
+  // ---- 3. 降级：本地 Tesseract，只有文本没有坐标 ----
+  onStage?.('服务器不可用，使用本地 OCR…')
+  try {
+    const { preloadOcr, PSM } = await import('./recognize')
+    const worker = await preloadOcr()
+    // 必须显式设 psm：preloadOcr 返回的是**被缓存复用的同一个 worker**，
+    // 它自己不设 pageseg_mode，而 recognizeSn 每次调用都会改这个参数
+    // （整图路径用 SPARSE_TEXT，裁切路径用 SINGLE_LINE/SINGLE_BLOCK）。
+    // 不显式设置，这里就会继承上一次调用留下的模式，行为随调用顺序变化。
+    // SPARSE_TEXT 与 recognizeSn 的整图路径一致，适合一张照片里散落的多个标签。
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
+    const { data } = await worker.recognize(canvas)
+    const text = data.text ?? ''
+    // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
+    // **绝不能拿去画框**。
+    const lines: OcrLine[] = text
+      .split(/\r?\n/)
+      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
+    return {
+      // 合成坐标是假的：markUnverified 置空 snBox（否则界面会在原图上画出凭空的黄框），
+      // 并把锚点类候选降为 pending（配对是按假坐标算的，不能当成已验证）。
+      // barcodeBoxes 保留：条码是 zxing 在原图上真实检测到的，位置可信。
+      devices: markUnverified(buildCandidates(lines, barcodes)),
+      rawText: text,
+      engine: 'tesseract',
+      degraded: true,
+      error: '服务器 OCR 不可用，已降级本地识别（无法标注位置）',
+    }
+  } catch {
+    return {
+      devices: buildCandidates([], barcodes),
+      rawText: '',
+      engine: 'none',
+      degraded: true,
+      error: 'OCR 全部失败，请手动输入',
+    }
+  }
 }
