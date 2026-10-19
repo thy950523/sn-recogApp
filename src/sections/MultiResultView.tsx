@@ -54,13 +54,28 @@ export default function MultiResultView({ image, onRetake }: Props) {
   // 实测（React 19 dev + StrictMode）：第一张照片永远转圈，换第二张才正常 ——
   // 而 src/main.tsx 正是包着 <StrictMode> 的，所以 `pnpm dev` 下必现。
   const aliveRef = useRef(true)
+  // 当前图片的 dataUrl。判定「这个结果还属于屏幕上这张图吗」必须用它，
+  // **不能只靠 aliveRef**。
+  //
+  // 只判 aliveRef 会串图：换照片时 cleanup 先把 aliveRef 置 false，但紧接着 run#2
+  // 又把它置回 true —— 于是**上一张**照片的识别完成时 aliveRef 已经是 true，
+  // 它的结果会盖到新照片上（setStage 也会串）。最终显示哪一张取决于两个 Promise
+  // 谁先完成，可能稳定错也可能偶发错。
+  //
+  // 注意：原来的局部 `let alive` 在这一点上是**对的**（run#1 的 alive₁ 不会被
+  // run#2 复活），它只是过不了 StrictMode。所以这次是「两个判据都要」，
+  // 不是「拿 ref 换掉局部变量」。
+  const urlRef = useRef(image.dataUrl)
   // 在飞的识别按 dataUrl 去重：StrictMode 的第二次运行拿回**同一个 Promise**，
-  // 于是它自己的 aliveRef 判定有效、结果照常落地，同时 OCR 只跑一遍。
+  // 于是它自己的判定有效、结果照常落地，同时 OCR 只跑一遍。
   const inflightRef = useRef<{ url: string; promise: Promise<MultiRecognizeResult> } | null>(null)
 
   useEffect(() => {
     aliveRef.current = true
     const url = image.dataUrl
+    urlRef.current = url
+    // 结果能否落地的唯一判据：组件还在，且这个结果对应的就是当前这张图。
+    const stillCurrent = () => aliveRef.current && urlRef.current === url
 
     const start = (): Promise<MultiRecognizeResult> => {
       const cached = inflightRef.current
@@ -80,7 +95,7 @@ export default function MultiResultView({ image, onRetake }: Props) {
             canvas.getContext('2d')!.drawImage(img, 0, 0)
             resolve(
               recognizeMulti(canvas, OCR_SERVER_URL, (s) => {
-                if (aliveRef.current) setStage(s)
+                if (stillCurrent()) setStage(s)
               }),
             )
           } catch (e) {
@@ -96,10 +111,10 @@ export default function MultiResultView({ image, onRetake }: Props) {
 
     start()
       .then((r) => {
-        if (aliveRef.current) setResult(r)
+        if (stillCurrent()) setResult(r)
       })
       .catch((e) => {
-        if (aliveRef.current) setFailed(e instanceof Error ? e.message : String(e))
+        if (stillCurrent()) setFailed(e instanceof Error ? e.message : String(e))
       })
 
     return () => {
