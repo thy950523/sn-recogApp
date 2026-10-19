@@ -9,21 +9,38 @@ interface Props {
   setScreen: (screen: { name: string }) => void
 }
 
-/** 将视频当前帧绘制到 canvas（限制最长边 1600px，兼顾精度与速度）并导出 JPEG */
-function captureFrame(video: HTMLVideoElement): ImagePayload | null {
-  const vw = video.videoWidth
-  const vh = video.videoHeight
-  if (!vw || !vh) return null
-  const scale = Math.min(1, 1600 / Math.max(vw, vh))
-  const w = Math.round(vw * scale)
-  const h = Math.round(vh * scale)
+/**
+ * 喂给 OCR 的取景载荷参数：最长边上限与 JPEG 质量。
+ *
+ * 与 `imageStore.saveCanvasImage` 存图用的 1280 / 0.78 是**两种用途**（一个喂识别、
+ * 一个落盘存证），各自独立合理，**不要**合并成同一个常量。
+ */
+const PAYLOAD_MAX_EDGE = 1600
+const PAYLOAD_JPEG_QUALITY = 0.9
+
+/**
+ * 把任意可绘制源（视频当前帧 / 相册图片）等比缩放到最长边不超过 `PAYLOAD_MAX_EDGE`
+ * 并编码为 JPEG 载荷；尺寸无效或取不到 2d context 时返回 null。
+ *
+ * 拍照与相册导入**必须**共用这一个函数：此前两条路径各自内联了一份相同的缩放 +
+ * 画布 + 编码逻辑，改一处忘另一处会让两条链路的 OCR 输入质量静默地不一致。
+ */
+function encodePayload(
+  source: CanvasImageSource,
+  srcWidth: number,
+  srcHeight: number,
+): ImagePayload | null {
+  if (!srcWidth || !srcHeight) return null
+  const scale = Math.min(1, PAYLOAD_MAX_EDGE / Math.max(srcWidth, srcHeight))
+  const w = Math.round(srcWidth * scale)
+  const h = Math.round(srcHeight * scale)
   const canvas = document.createElement('canvas')
   canvas.width = w
   canvas.height = h
   const ctx = canvas.getContext('2d')
   if (!ctx) return null
-  ctx.drawImage(video, 0, 0, w, h)
-  return { dataUrl: canvas.toDataURL('image/jpeg', 0.9), width: w, height: h }
+  ctx.drawImage(source, 0, 0, w, h)
+  return { dataUrl: canvas.toDataURL('image/jpeg', PAYLOAD_JPEG_QUALITY), width: w, height: h }
 }
 
 export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Props) {
@@ -105,11 +122,14 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
   const handleShutter = useCallback(() => {
     const video = videoRef.current
     if (!video) return
-    const img = captureFrame(video)
-    if (img) {
-      stopCamera()
-      onShot(img)
+    const img = encodePayload(video, video.videoWidth, video.videoHeight)
+    if (!img) {
+      // 取景尚未就绪（如 autoplay 失败导致画面为黑）时不能静默：给用户可见反馈
+      setLoadError('取景尚未就绪或画面不可用，请稍候重试。')
+      return
     }
+    stopCamera()
+    onShot(img)
   }, [onShot, stopCamera])
 
   /** 系统相机 / 相册导入 */
@@ -123,15 +143,14 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
       reader.onload = () => {
         const img = new Image()
         img.onload = () => {
-          const scale = Math.min(1, 1600 / Math.max(img.width, img.height))
-          const w = Math.round(img.width * scale)
-          const h = Math.round(img.height * scale)
-          const canvas = document.createElement('canvas')
-          canvas.width = w
-          canvas.height = h
-          canvas.getContext('2d')!.drawImage(img, 0, 0, w, h)
+          const payload = encodePayload(img, img.width, img.height)
+          if (!payload) {
+            // 取不到 2d context 等情况：给可见提示，别让用户选完照片界面毫无变化
+            setLoadError('图片处理失败，请重试。')
+            return
+          }
           stopCamera()
-          onShot({ dataUrl: canvas.toDataURL('image/jpeg', 0.9), width: w, height: h })
+          onShot(payload)
         }
         img.onerror = () =>
           setLoadError('照片格式无法解析。若使用 iPhone，请在 设置→相机→格式 中选用「兼容性最佳」。')
