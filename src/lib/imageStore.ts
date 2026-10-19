@@ -129,6 +129,8 @@ export async function getImageBlob(id: string): Promise<Blob | null> {
 const urlCache = new Map<string, string>()
 // 同一 id 的并发请求只创建一个 Object URL；否则并发 miss 会各建一个，先返回的那个永远泄漏
 const urlPending = new Map<string, Promise<string | null>>()
+// 在 await getImageBlob 期间被释放的 id：resolve 后不再建 URL，否则该 URL 永远无人回收
+const releasedDuringLoad = new Set<string>()
 
 /** 取图片的 Object URL（用于 <img src>）；不存在返回 null */
 export function getImageUrl(id: string): Promise<string | null> {
@@ -137,16 +139,23 @@ export function getImageUrl(id: string): Promise<string | null> {
   const pending = urlPending.get(id)
   if (pending) return pending
 
+  releasedDuringLoad.delete(id) // 新一轮加载开始，清掉上一轮的释放标记
   const p = (async () => {
     const blob = await getImageBlob(id)
     if (!blob) return null
-    // await 期间可能有别的路径写入缓存或释放，复查一次
+    // await 期间被释放：不能再建 URL，否则永远没人 revoke
+    if (releasedDuringLoad.has(id)) return null
+    // await 期间可能有别的路径写入缓存，复查一次
     const raced = urlCache.get(id)
     if (raced) return raced
     const url = URL.createObjectURL(blob)
     urlCache.set(id, url)
     return url
-  })().finally(() => urlPending.delete(id))
+  })().finally(() => {
+    // releaseImageUrl 现在会 urlPending.delete(id)，释放后同一 id 可能已被新一轮请求写入新的 pending；
+    // 若无条件 delete 就会把这一轮的 pending 抹掉，其并发请求随即各建一个 Object URL，去重失效
+    if (urlPending.get(id) === p) urlPending.delete(id)
+  })
 
   urlPending.set(id, p)
   return p
@@ -158,9 +167,13 @@ export function getImageUrl(id: string): Promise<string | null> {
  */
 export function releaseImageUrl(id: string): void {
   const url = urlCache.get(id)
-  if (!url) return
-  URL.revokeObjectURL(url)
-  urlCache.delete(id)
+  if (url) {
+    URL.revokeObjectURL(url)
+    urlCache.delete(id)
+  }
+  // 加载仍在进行：标记释放，令其 resolve 为 null；不能让它在 resolve 后建出无人回收的 URL
+  if (urlPending.has(id)) releasedDuringLoad.add(id)
+  urlPending.delete(id)
 }
 
 /** 批量删除图片 */
@@ -191,8 +204,17 @@ export async function estimateUsage(): Promise<{ count: number; bytes: number }>
 
 /** 清空全部图片 */
 export async function clearAll(): Promise<void> {
+  // 在途加载无法取消，而且可能在事务提交前就 resolve 出 URL：必须现在标记作废，
+  // 否则等提交后再处理时它已离开 urlPending，建出的 URL 就无人回收。
+  // 只挑还没有缓存 URL 的 id：不 revoke 任何东西，事务回滚也不会误伤已缓存 URL。
+  for (const id of [...urlPending.keys()]) {
+    if (!urlCache.has(id)) releaseImageUrl(id)
+  }
   await withStore('readwrite', (s) => s.clear() as IDBRequest<undefined>)
-  for (const id of [...urlCache.keys()]) releaseImageUrl(id)
+  // 事务提交后再 revoke 已缓存 URL：删除失败回滚时不能提前清掉缓存
+  // 先快照再迭代：releaseImageUrl 会 urlPending.delete(id)，边迭代边删会漏项；
+  // 也覆盖加载期间新发起的请求，否则它们同样会留下无人回收的 URL
+  for (const id of new Set([...urlCache.keys(), ...urlPending.keys()])) releaseImageUrl(id)
 }
 
 /**

@@ -70,6 +70,15 @@ describe('imageStore', () => {
     ).rejects.toThrow()
   })
 
+  it('deleteImages 中途同步抛错时回滚已排队的删除', async () => {
+    const a = await putImage(jpeg(), 1, 1)
+    const b = await putImage(jpeg(), 1, 1)
+    // 非法 key 让第 2 个 delete 同步抛 DataError，触发 withStore 的 abort 回滚
+    await expect(deleteImages([a, undefined as unknown as string])).rejects.toThrow()
+    expect(await getImageBlob(a)).not.toBeNull()
+    expect(await getImageBlob(b)).not.toBeNull()
+  })
+
   it('Object URL 缓存可复用且能被释放', async () => {
     const id = await putImage(jpeg(), 1, 1)
     const first = await getImageUrl(id)
@@ -82,6 +91,36 @@ describe('imageStore', () => {
     expect(second).toMatch(/^blob:/)
     expect(second).not.toBe(first)
     releaseImageUrl(id)
+  })
+
+  it('加载途中释放：不创建 Object URL，且 promise resolve 为 null', async () => {
+    const id = await putImage(jpeg(), 1, 1)
+    const spy = vi.spyOn(URL, 'createObjectURL')
+    const p = getImageUrl(id)
+    releaseImageUrl(id) // 仍在 await getImageBlob 期间
+    await expect(p).resolves.toBeNull()
+    expect(spy).not.toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it('加载途中释放后，再次取图仍能正常拿到 URL', async () => {
+    const id = await putImage(jpeg(), 1, 1)
+    const p = getImageUrl(id)
+    releaseImageUrl(id)
+    await p
+    const url = await getImageUrl(id)
+    expect(url).toBeTruthy()
+    releaseImageUrl(id)
+  })
+
+  it('clearAll 会作废仍在加载中的图片，不留下无人回收的 URL', async () => {
+    const id = await putImage(jpeg(), 1, 1)
+    const spy = vi.spyOn(URL, 'createObjectURL')
+    const p = getImageUrl(id)
+    await clearAll()
+    await expect(p).resolves.toBeNull()
+    expect(spy).not.toHaveBeenCalled()
+    spy.mockRestore()
   })
 
   it('getImageUrl 对不存在的 id 返回 null', async () => {

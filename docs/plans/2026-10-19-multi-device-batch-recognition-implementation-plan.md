@@ -517,6 +517,28 @@ Expected: `8 passed`。
 > 已改为「请求取结果、事务提交才算成功、中止即 reject」。另外补了 3 条测试
 > （失败路径 reject、Object URL 缓存复用与释放、不存在 id 返回 null）。
 
+> **修订（质量审查后）**：在上一轮基础上又修了三处竞态，最终测试数 **19**。
+> 1. **并发取图去重**：`getImageUrl` 加 `urlPending` 在途 Promise 去重 + `raced` 复查。
+>    React StrictMode 的 mount→cleanup→mount 会并发触发同一 id，原先会各建一个
+>    Object URL，先返回的那个永远泄漏。
+> 2. **`withStore` 同步抛错回滚**：`fn(tx.objectStore(...))` 同步抛错时，事务里可能已
+>    排入部分写操作，调用方却收到 reject —— 已在 catch 中先 `tx.abort()` 再 fail。
+>    有回归测试（`deleteImages([a, undefined])` 让第 2 个 delete 同步抛 `DataError`）。
+> 3. **加载途中释放**：`getImageUrl` 仍在 `await getImageBlob` 期间调用
+>    `releaseImageUrl`，原先释放是空操作，promise resolve 后照样建 URL 并缓存，
+>    该 URL 再无人回收。已加 `releasedDuringLoad` 标记，令其 resolve 为 null。
+> 4. **`clearAll` 必须在事务前作废在途加载**：只遍历 `urlCache` 不够 —— 在途的读事务
+>    可能在 `await withStore(...)` 期间 resolve，id 届时已从 `urlPending` 挪进 `urlCache`。
+>    做法：await **之前**给「仅在途、无缓存 URL」的 id 打作废标记（只写标记、不 revoke，
+>    事务回滚也不会误伤已缓存 URL），提交后再统一 revoke。
+> 5. **`.finally` 的身份比对**：`releaseImageUrl` 现在会 `urlPending.delete(id)`，旧
+>    promise 的 `finally` 必须只删自己那一条（`urlPending.get(id) === p`），否则会抹掉
+>    新一轮写入的 pending，并发去重失效。此守卫**无专门测试**（构造稳定区分的时序不可行），
+>    靠代码审查 + 注释约束。
+>
+> 已知环境限制：`tx.onabort` / `tx.onerror` 两条异步中止分支无自动化测试 ——
+> fake-indexeddb 6.2.6 无法模拟提交期配额失败或外部触发的异步 abort。
+
 **Step 5: 类型检查**
 
 ```bash
