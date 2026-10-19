@@ -988,7 +988,10 @@ const bar = (value: string, y0: number, y1: number): { value: string; box: Box4 
 
 describe('snFromLine', () => {
   it('优先取 S/N 标记后的值', () => {
-    expect(snFromLine('S/N: 8A7C2D1E')).toBe('8A7C2D1E')
+    // 必须用 6 位的短 SN：兜底的 extractSnCandidates 要求 8 位以上，取不到它，
+    // 于是这条只有走「标记优先」分支才能通过。若写 'S/N: 8A7C2D1E'，
+    // 两条路径同值，把标记分支整段删掉这条仍然绿 —— 等于没测。
+    expect(snFromLine('S/N: A1B2C3')).toBe('A1B2C3')
   })
   it('无标记时取疑似 SN 的字母数字混合串', () => {
     expect(snFromLine('8A7C2D1E9F')).toBe('8A7C2D1E9F')
@@ -1051,8 +1054,14 @@ describe('buildCandidates', () => {
     const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14), line('S/N: 9B8D3E2F', 0.30, 0.34)]
     const barcodes = [bar('9B8D3E2F', 0.24, 0.28)]
     const devices = buildCandidates(lines, barcodes)
+    // 必须断言条数与 status：只断言 barcode 的话，当阈值被改小、条码谁也没认领、
+    // 另起一条 barcode_only 时，那条候选按 y 排序恰好落到 devices[1]，
+    // barcode 断言照样通过（假绿）。status 才区分「锚点认领」与「补出来的候选」。
+    expect(devices).toHaveLength(2)
     expect(devices[0].barcode).toBeNull()
+    expect(devices[0].status).toBe('ocr_only')
     expect(devices[1].barcode).toBe('9B8D3E2F')
+    expect(devices[1].status).toBe('match')
   })
 
   it('没有任何条码时，S/N 行仍各成一条 ocr_only', () => {
@@ -1401,6 +1410,16 @@ export async function scanBarcodes(
 }
 ```
 
+**同时把 `PSM` 转出**（`recognize.ts` 第 3 行已经从 `tesseract.js` 导入了它，转出零成本）：
+
+```ts
+export { PSM }
+```
+
+> **为什么必须转出而不是在 `multiRecognize.ts` 里直接 `import { PSM } from 'tesseract.js'`**：
+> 那会让 `multiRecognize.ts` 顶层加载 tesseract.js，Task 6 的纯函数单测在 Node 里就跑不动了
+> —— 这正是本任务要求用动态 `import('./recognize')` 的原因。转出后走同一条动态导入即可拿到 PSM。
+
 **Step 2: 在 `multiRecognize.ts` 追加服务端 OCR 调用与主入口**
 
 在 `multiRecognize.ts` 末尾追加：
@@ -1475,6 +1494,36 @@ async function callServerOcr(
   }
 }
 
+// 这里没有复用 recognize.ts 里已有的 runServerOcr（第 289 行），原因有二，都是硬约束：
+//   1. multiRecognize.ts 不能静态 import './recognize'（它顶层加载 tesseract.js 与 zxing-wasm，
+//      会打断 Node 单测）；把 runServerOcr 搬出来又要新建模块、改动核心识别文件，风险大于收益。
+//   2. 两者需求不同：recognizeSn 要把整图按 0.92 质量原样上传（标签字小，不能再降采样）；
+//      一图多码是整张照片，必须缩到 1600px 再传，否则体积和耗时都不可接受。
+// 因此这是**有意重复**，不是漏改。若日后要合并，先给 runServerOcr 加上「是否降采样」参数。
+
+/**
+ * 降级模式：OCR 没给出坐标，条码与 S/N 的配对是按合成坐标算的，几何上不可信。
+ *
+ * 把锚点类候选（match / mismatch / ocr_only）一律改为 `pending`（待人工确认），
+ * 否则一张好照片会因为配对错位被标成「⚠ 与条码不一致」——那是在误导用户丢弃正确数据。
+ * `barcode_only` 保持原样：它的 SN 直接来自 zxing 在原图上真实读到的条码，
+ * 位置也是真实的，不涉及合成坐标，标成「仅条码」比「待人工确认」信息量更大。
+ *
+ * `snBox` 同时置空：合成坐标绝不能拿去画框。
+ */
+export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
+  return devices.map((d) =>
+    d.status === 'barcode_only'
+      ? d
+      : {
+          ...d,
+          status: 'pending' as VerifyStatus,
+          note: 'OCR 未返回文字坐标，设备配对未经位置校验，请人工核对',
+          snBox: null,
+        },
+  )
+}
+
 /**
  * 一图多码识别主入口。
  *
@@ -1523,12 +1572,13 @@ export async function recognizeMulti(
 
     // 服务器有文本但没有坐标（如中转层的 Tesseract 分支）：
     // 不能因为没坐标就把这段 OCR 文本丢掉，否则 SN/IMEI 信息全没了。
-    // 合成坐标只用于按顺序归组，snBox 一律置空（不画框）。
+    // 合成坐标只用于按顺序归组；markUnverified 会置空 snBox（不画框）
+    // 并把锚点类候选降为 pending —— 合成坐标算出的配对不可信。
     const synth: OcrLine[] = server.text
       .split(/\r?\n/)
       .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
     return {
-      devices: buildCandidates(synth, barcodes).map((d) => ({ ...d, snBox: null })),
+      devices: markUnverified(buildCandidates(synth, barcodes)),
       rawText: server.text,
       engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
       degraded: true,
@@ -1539,19 +1589,26 @@ export async function recognizeMulti(
   // ---- 3. 降级：本地 Tesseract，只有文本没有坐标 ----
   onStage?.('服务器不可用，使用本地 OCR…')
   try {
-    const { preloadOcr } = await import('./recognize')
+    const { preloadOcr, PSM } = await import('./recognize')
     const worker = await preloadOcr()
+    // 必须显式设 psm：preloadOcr 返回的是**被缓存复用的同一个 worker**，
+    // 它自己不设 pageseg_mode，而 recognizeSn 每次调用都会改这个参数
+    // （整图路径用 SPARSE_TEXT，裁切路径用 SINGLE_LINE/SINGLE_BLOCK）。
+    // 不显式设置，这里就会继承上一次调用留下的模式，行为随调用顺序变化。
+    // SPARSE_TEXT 与 recognizeSn 的整图路径一致，适合一张照片里散落的多个标签。
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
     const { data } = await worker.recognize(canvas)
     const text = data.text ?? ''
     // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
-    // **绝不能拿去画框** —— 见下方 devices.map 把 snBox 置空。
+    // **绝不能拿去画框**。
     const lines: OcrLine[] = text
       .split(/\r?\n/)
       .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
     return {
-      // 合成坐标是假的，必须把 snBox 置空，否则界面会在原图上画出凭空的黄框。
+      // 合成坐标是假的：markUnverified 置空 snBox（否则界面会在原图上画出凭空的黄框），
+      // 并把锚点类候选降为 pending（配对是按假坐标算的，不能当成已验证）。
       // barcodeBoxes 保留：条码是 zxing 在原图上真实检测到的，位置可信。
-      devices: buildCandidates(lines, barcodes).map((d) => ({ ...d, snBox: null })),
+      devices: markUnverified(buildCandidates(lines, barcodes)),
       rawText: text,
       engine: 'tesseract',
       degraded: true,
@@ -1579,30 +1636,95 @@ import { assignByNearestY, boxCenterY, normalizeBox, type Box4 } from './deviceB
 **不要**在文件顶部静态 import `./recognize` —— 它顶层加载 tesseract.js 与 zxing-wasm，
 静态引用会让 Task 6 的纯函数单测在 Node 里跑不动。
 
-**Step 3: 类型检查**
+**Step 3: 给 `markUnverified` 补单测**
+
+主入口 `recognizeMulti` 依赖 canvas / fetch / worker，确实只能手工验。
+但 `markUnverified` 是纯函数，且它承担着「降级时不能给出误导性状态」这个关键行为——
+必须单测。
+
+在 `src/lib/multiRecognize.test.ts` 里**把文件顶部原有的导入行替换为**（不是新增一行，
+否则同一模块会有两条 import）：
+
+```ts
+import {
+  buildCandidates,
+  markUnverified,
+  snFromLine,
+  type DeviceCandidate,
+  type OcrLine,
+} from './multiRecognize'
+```
+
+然后追加用例：
+
+```ts
+describe('markUnverified', () => {
+  const cand = (over: Partial<DeviceCandidate>): DeviceCandidate => ({
+    sn: '8A7C2D1E',
+    barcode: null,
+    barcodes: [],
+    imei: null,
+    imei2: null,
+    meid: null,
+    eid: null,
+    rawOcr: '',
+    status: 'ocr_only',
+    note: null,
+    snBox: [0.1, 0.1, 0.9, 0.14],
+    barcodeBoxes: [],
+    ...over,
+  })
+
+  it('锚点类候选降为 pending 并清空 snBox（合成坐标不能画框）', () => {
+    const out = markUnverified([
+      cand({ status: 'match', barcode: '8A7C2D1E' }),
+      cand({ status: 'mismatch' }),
+      cand({ status: 'ocr_only' }),
+    ])
+    // 降级后不能再出现 match/mismatch —— 否则一张好照片会被标成「与条码不一致」，
+    // 用户会据此丢掉正确数据
+    expect(out.map((d) => d.status)).toEqual(['pending', 'pending', 'pending'])
+    expect(out.every((d) => d.snBox === null)).toBe(true)
+    expect(out[0].note).toContain('人工核对')
+  })
+
+  it('barcode_only 保持原样：条码位置是真实检测到的，不涉及合成坐标', () => {
+    const b = cand({
+      sn: '9B8D3E2F',
+      status: 'barcode_only',
+      barcode: '9B8D3E2F',
+      snBox: null,
+      barcodeBoxes: [[0.1, 0.88, 0.9, 0.92]],
+      note: '未读到 S/N 文字，仅有条码',
+    })
+    expect(markUnverified([b])).toEqual([b])
+  })
+})
+```
+
+**Step 4: 类型检查与测试**
 
 ```bash
 npx tsc -b && npx vitest run
 ```
 
-Expected: 无类型错误，全部测试通过。
+Expected: 无类型错误；**52 passed**（Task 6 的 50 + `markUnverified` 2 条）。
 
-**Step 4: 手工验证（浏览器控制台）**
+按本项目标准，这两条也要做**变异验证**：把 `markUnverified` 里 `d.status === 'barcode_only' ? d : {...}`
+的三元分支去掉（一律降级），第二条必须变红；把 `status: 'pending'` 改回 `d.status`，第一条必须变红。
+验完还原，`git diff --stat src/lib/multiRecognize.ts` 应为空。
 
-```bash
-npm run dev
-```
+**Step 5: 说明本步的验证边界**
 
-打开 `https://localhost:3000`，控制台执行（需先确保 OCR 服务在跑）：
+`recognizeMulti` 依赖 canvas、`fetch`、tesseract worker，在 Node 里无法单测，
+而它唯一的调用方是 `MultiResultView`（Task 8 才建、Task 10 才接线）。
+所以**本步不写手工验证步骤** —— 没有界面入口时在控制台里拼一个 canvas 去调它，
+验的是「我拼得对不对」而不是「它跑得对不对」，没有价值。
 
-```js
-// 造一张有文字的测试图不方便，改为直接验证接口连通性
-fetch('/ocr', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: await (await fetch('data:image/jpeg;base64,')).blob() })
-```
+真正的端到端验证落在 **Task 10 的 Step 5 手工冒烟**（拍照 → 进批量识别页 → 看框与候选列表），
+以及 **Task 14 的验收标准 6**（停掉 OCR 服务走本地降级）。本步只需确认 `tsc` 与测试通过。
 
-更实际的验证放到 Task 11 完成后，用真实照片在界面里跑。这里只需确认 `tsc` 与测试通过。
-
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add src/lib/multiRecognize.ts src/lib/recognize.ts
@@ -1827,6 +1949,12 @@ Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表
 
 **Step 2: 加候选行状态与勾选逻辑**
 
+先把 Task 8 故意没解构的三个 prop 解构出来（现在要用它们了，`noUnusedLocals` 才会满意）：
+
+```tsx
+export default function MultiResultView({ image, existingSns, onRetake, onRegister, imageId }: Props) {
+```
+
 在组件内、`devices` 之后加入：
 
 ```tsx
@@ -1877,7 +2005,11 @@ Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表
         verified: r.source.status === 'match' && r.source.barcode === r.sn,
         barcode: r.source.barcode,
         barcodes: r.source.barcodes,
-        ocr: r.source.status === 'match' || r.source.status === 'ocr_only' ? r.source.sn : null,
+        // pending 的 SN 同样是 OCR 读出来的（只是缺坐标），不能从 ocr 字段里丢掉
+        ocr:
+          r.source.status === 'match' || r.source.status === 'ocr_only' || r.source.status === 'pending'
+            ? r.source.sn
+            : null,
         imei: r.source.imei,
         imei2: r.source.imei2,
         meid: r.source.meid,
@@ -1897,11 +2029,15 @@ Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表
         {rows.map((row, i) => {
           const d = row.source
           const dup = isDuplicate(row.sn, i)
+          // pending 是 Task 7 降级路径（OCR 无坐标）产出的状态，必须显式列出：
+          // 落到最后的兜底会显示成「⛔ 未识别」，那是在说「没识别到」，
+          // 而实际是「识别到了但配对未经校验」——两回事，会误导用户重拍。
           const statusLabel =
             d.status === 'match' ? '✓ 双验证一致'
               : d.status === 'mismatch' ? '⚠ 与条码不一致'
               : d.status === 'barcode_only' ? '⚠ 仅条码'
               : d.status === 'ocr_only' ? '⚠ 仅 OCR'
+              : d.status === 'pending' ? '⚠ 待人工确认'
               : '⛔ 未识别'
           const statusClass =
             d.status === 'match' ? 'border-[#35d07f]/60 text-[#35d07f]'
@@ -1996,7 +2132,7 @@ npx tsc -b && npm run lint
 
 Expected: 无错误。
 
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
 git add src/sections/MultiResultView.tsx
@@ -2170,7 +2306,7 @@ git commit -m "feat(ui): 拍照流程统一走批量识别页，移除 ResultVie
 `Home.tsx` 改为：
 
 ```tsx
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { saveCanvasImage } from '@/lib/imageStore'
 ```
 
@@ -2188,8 +2324,17 @@ export default function Home() {
   /**
    * 拍照/导入后：先尽量把图片存进 IndexedDB，再进识别页。
    * 存图失败（配额满等）不能让流程中断 —— 记录照样能登记，只是没有图。
+   *
+   * 为什么必须加 savingRef 锁：本函数改成 async 后，存图期间 ScanView 还没卸载，
+   * 快门按钮仍然可点（handleShutter 只检查 videoRef，而 stopCamera 后 videoRef 仍在，
+   * 再点一次会抓到最后那一帧的副本）。第二次点击会再存一张图，而它对应的 screen
+   * 会被后一次 setScreen 覆盖 —— 那张图的 imageId 永远不会被任何记录引用，
+   * 成为只占空间、只能靠「清空全部」才能回收的孤儿图。
    */
+  const savingRef = useRef(false)
   const handleShot = useCallback(async (image: ImagePayload) => {
+    if (savingRef.current) return
+    savingRef.current = true
     let imageId: string | null = null
     try {
       const canvas = document.createElement('canvas')
