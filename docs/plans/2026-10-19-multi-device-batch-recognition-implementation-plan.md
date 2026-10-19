@@ -2572,6 +2572,45 @@ git commit -m "feat(ui): 候选列表勾选/编辑/删除与批量登记"
 
 ---
 
+### Task 9 执行后的勘误与追加（已落地，实际代码以此为准）
+
+本步最终是两个 commit：`6effa60`（按上面规格实现）+ `97e30be`/`4c9294b`（复审后的修复轮）。
+上面 Step 2 的代码块有几处已被后续修复取代，**读代码时不要以那个代码块为准**：
+
+1. **`isDuplicate` 与默认勾选闸门都必须按归一化 SN 比较。**
+   原规格写的是 `existingSns.includes(sn)`，这是**规格级缺陷**（不是实现者笔误）：
+   记录里的 `sn` 是用户可编辑自由文本（`editSn` 只大写化、不剥离分隔符），
+   而 OCR 侧的 `DeviceCandidate.sn` 永远是纯字母数字。用户把 SN 改成 `AB-12-34`
+   登记后再拍同一台设备（OCR 出 `AB1234`），判重失败 → **既不标红又默认勾选 →
+   无提示重复登记**，验收标准 2 静默失效。
+   修法是两处一起用 `normalizeSn`：`isDuplicate`（红标）与初始化 effect 里的
+   `existingRef.current.some((s) => normalizeSn(s) === d.sn)`（默认勾选）。
+   **只改一处会出现「红标说重复、勾选框却默认勾上」的自相矛盾。**
+
+2. **登记映射抽成了纯函数** `rowsToRecords(rows, imageId)`，见新建的
+   `src/lib/registerRows.ts` + `src/lib/registerRows.test.ts`（12 条用例，已做变异测试）。
+   组件里 `rows` 的类型是那里导出的 `CandidateRow`。
+   理由：这段映射决定「什么被写进数据库」，其中几条规则不直观（`pending` 也算 OCR 值、
+   `source`/`verified` 依赖条码比对），且曾经改错过一次。
+
+3. **`rowsToRecords` 里 `sn` 存归一化值**，且 `source`/`verified` 的条码比对也改用归一化后的
+   `sn`。这是有意的行为改进：条码值本身经 `toHit` → `normalizeSn` 已是纯字母数字，
+   所以一个手改成 `AB-12-34` 而条码是 `AB1234` 的行，现在会被正确判为
+   `source='barcode'`、`verified=true`；以前会被误判成「人工确认」。
+
+4. **过滤判据用 `normalizeSn(r.sn) !== ''`，不是 `r.sn.trim()`**，且组件里 `checkedCount`
+   必须用同一判据。`"---".trim()` 是真值会放行，而归一化后是空串 → 会写进一条
+   `sn` 为空的垃圾记录。两处判据不一致还会退回「按钮说 N 条、实际存 M 条」的静默不一致。
+
+5. **`isDuplicate` 里 `if (!n) return false`**：两行都被清空时它们归一化后都是空串、
+   会互相判重，两行各挂一个 ⛔ 重复 —— 而空行本就不参与登记。
+
+6. 另有三处小修：`drop` 里加 `setActiveIndex(null)`（删行后高亮会跳到另一台设备）；
+   复选框与删除按钮补 `aria-label`；空态文案按 `result.devices.length === 0`
+   区分「OCR 没识别到」与「用户自己删光了」，后者不该提示「请重拍」。
+
+---
+
 ## Task 10: 接线到拍照流程，删除 ResultView
 
 **Files:**
