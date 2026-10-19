@@ -1630,25 +1630,30 @@ function boxStyle(box: Box4): CSSProperties {
   }
 }
 
-const OCR_SERVER_URL = window.location.origin
+/** 序号角标只需要左上角。复用 boxStyle 会同时设 width/height，把角标拉成整框大小的黄条 */
+function badgeStyle(box: Box4): CSSProperties {
+  return { left: `${box[0] * 100}%`, top: `${box[1] * 100}%` }
+}
 
-export default function MultiResultView({
-  image,
-  existingSns,
-  onRetake,
-  onRegister,
-  imageId,
-}: Props) {
+export default function MultiResultView({ image, onRetake }: Props) {
   const [stage, setStage] = useState('准备识别…')
   const [result, setResult] = useState<MultiRecognizeResult | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
   /** 当前高亮的候选下标（点列表行时联动高亮框） */
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
-  const ranRef = useRef(false)
+  // 通过 Vite proxy 自动代理到本机 OCR 服务；放在组件内而非模块级，
+  // 避免模块被导入到非浏览器环境时直接访问 window 报错
+  const OCR_SERVER_URL = window.location.origin
+  const lastUrlRef = useRef<string | null>(null)
 
   useEffect(() => {
-    if (ranRef.current) return
-    ranRef.current = true
+    // 同一张图已识别过就跳过：StrictMode 会把 effect 跑两遍，而 OCR 很贵。
+    // 必须记住「已处理的 dataUrl」而不是用布尔锁 —— 布尔锁会让同一组件实例
+    // 换一张照片（dataUrl 变化）时也不重新识别，永远显示上一张的结果。
+    if (lastUrlRef.current === image.dataUrl) return
+    lastUrlRef.current = image.dataUrl
+
+    let alive = true
     const img = new Image()
     img.onload = async () => {
       const canvas = document.createElement('canvas')
@@ -1656,15 +1661,22 @@ export default function MultiResultView({
       canvas.height = img.height
       canvas.getContext('2d')!.drawImage(img, 0, 0)
       try {
-        const r = await recognizeMulti(canvas, OCR_SERVER_URL, setStage)
-        setResult(r)
+        const r = await recognizeMulti(canvas, OCR_SERVER_URL, (s) => {
+          if (alive) setStage(s)
+        })
+        if (alive) setResult(r)
       } catch (e) {
-        setFailed(String(e))
+        if (alive) setFailed(String(e))
       }
     }
-    img.onerror = () => setFailed('图片无法解析')
+    img.onerror = () => {
+      if (alive) setFailed('图片无法解析')
+    }
     img.src = image.dataUrl
-  }, [image.dataUrl])
+    return () => {
+      alive = false
+    }
+  }, [image.dataUrl, OCR_SERVER_URL])
 
   const devices = result?.devices ?? []
 
@@ -1709,7 +1721,7 @@ export default function MultiResultView({
               {/* 序号角标 */}
               <span
                 className="absolute -translate-y-full bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black"
-                style={boxStyle(d.snBox ?? d.barcodeBoxes[0] ?? [0, 0, 0, 0])}
+                style={badgeStyle(d.snBox ?? d.barcodeBoxes[0] ?? [0, 0, 0, 0])}
               >
                 {i + 1}
               </span>
@@ -1750,8 +1762,9 @@ export default function MultiResultView({
 npx tsc -b
 ```
 
-Expected: 无错误。此时 `activeIndex`、`existingSns`、`onRegister`、`imageId` 尚未使用，
-若 `noUnusedLocals` 报错，先在这几个参数前加 `_` 前缀占位（Task 9 会真正用上并改回）。
+Expected: 无错误。`Props` 里的 `existingSns` / `onRegister` / `imageId` 本步**先不解构**
+（Task 9 才用），因此不会触发 `noUnusedLocals`；不要用 `_` 前缀改名占位，
+那会让 Task 9 再改回来，徒增噪音。
 
 **Step 3: Commit**
 
