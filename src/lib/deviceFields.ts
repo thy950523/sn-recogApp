@@ -33,7 +33,18 @@ export function extractSnByMarker(text: string): string | null {
 
 export interface DeviceFieldsResult {
   sn: MatchedField | null
-  /** 按 IMEI1、IMEI2 顺序排列（槽位数字优先，未知槽位按出现顺序） */
+  /**
+   * 按槽位 1、2 顺序排列（槽位数字优先）。
+   *
+   * 未标槽位的 IMEI 会在补槽位阶段占用空闲槽位，因此**正常情况下这里不会出现
+   * `slot: null`** —— 只有 1、2 两个槽位都已被占满（如机身印了三个 IMEI）时，
+   * 溢出的那条才会保持 `slot: null` 并排在最后。
+   *
+   * **消费侧一律用 `imeiBySlot` 按槽位取值，不要按下标取**（`imeis[0]` / `imeis[1]`）：
+   * 数组虽已按槽位排过序，但槽位 1 可能整个缺席（机身只印 IMEI2、或 OCR 漏读 IMEI1 那行），
+   * 此时 `imeis[0].slot === 2`，按下标取会把 IMEI2 的值填进 imei 字段、imei2 留空 ——
+   * 两个字段的标签整体写反。详见 `imeiBySlot`。
+   */
   imeis: ImeiField[]
   meid: MatchedField | null
   eid: MatchedField | null

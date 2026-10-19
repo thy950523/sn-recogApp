@@ -87,7 +87,7 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
               await videoRef.current.play()
             } catch {
               // play() 失败（浏览器拒绝自动播放、相机被其他应用占用等）时画面不会有任何帧，
-              // 于是 captureFrame 必然拿到 videoWidth===0 而返回 null —— 用户点「拍照识别」将毫无反应。
+              // 于是 encodePayload 必然拿到 videoWidth===0 而返回 null —— 用户点「拍照识别」将毫无反应。
               // 不能吞这个错：设置 cameraError 一举两得 —— 它渲染全屏提示浮层说明原因，
               // 又把底部按钮从 handleShutter 切到系统相机，用户不再撞在死路径上。
               if (cancelled) {
@@ -155,7 +155,7 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
     const video = videoRef.current
     if (!video) {
       // 防御性补齐：当前代码下不可达（<video> 无条件渲染、effect 在 commit 后运行），
-      // 但静默返回会让用户点了按钮却毫无反应。与下面 captureFrame 返回 null 时同一套
+      // 但静默返回会让用户点了按钮却毫无反应。与下面 encodePayload 返回 null 时同一套
       // 可见反馈（setLoadError），不吞错。
       setLoadError('取景组件尚未就绪，请稍候重试。')
       return
