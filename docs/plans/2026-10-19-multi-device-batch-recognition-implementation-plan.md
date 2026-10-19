@@ -2722,7 +2722,21 @@ import { estimateUsage, getImageUrl, releaseImageUrl } from '@/lib/imageStore'
   const [usage, setUsage] = useState<{ count: number; bytes: number }>({ count: 0, bytes: 0 })
 
   useEffect(() => {
-    void estimateUsage().then(setUsage)
+    // 推迟一拍再读，不要立即读。
+    //
+    // 删图是在 Home 的 useRecords effect 里做的，而 React 的 effect 顺序是
+    // **子组件先于父组件** —— RecordsView 的这个 effect 会比 Home 的删图 effect 先跑。
+    // withStore 会同步发起 indexedDB.open（openDb 不缓存连接），于是读的 open
+    // 先于删的 open 发出，读事务也就先建立；IndexedDB 按事务建立顺序执行，
+    // 结果**每次都稳定读到删除前的张数**（不是偶发，是必然），
+    // 底部那行「图片 N 张」会一直慢一拍，直到 records 因别的原因再变一次。
+    //
+    // 推迟一个宏任务：此时父组件的删图请求已经发出，读事务会被排在删事务之后，
+    // 看到的就是删除后的状态。清空（clearAll 在点击处理函数里同步发起）同理。
+    const t = setTimeout(() => {
+      void estimateUsage().then(setUsage)
+    }, 0)
+    return () => clearTimeout(t)
   }, [records])
 
   const mb = (usage.bytes / 1024 / 1024).toFixed(1)
@@ -2747,7 +2761,13 @@ Expected: 无错误。
 **Step 5: 手工验证**
 
 记录页每行左侧出现缩略图；底部显示「图片 N 张 / X.XMB」。
-删除一条记录后，图片张数减 1。
+
+逐项确认：
+1. 删除一条记录后，图片张数**当场**减 1（不需要切走再切回来）。
+2. 一图多码登记的几条记录共用一张图时，删掉其中一条，张数**不变**（图还被兄弟记录引用）；
+   删掉最后一条才减 1。
+3. 拍照后点「重拍」不登记，再清空记录 —— 张数应归 0（孤儿照片由 `clearAll` 清掉，
+   见 Step 0）。若清空后仍非 0，说明孤儿没清干净，验收标准 5 会失败。
 
 **Step 6: Commit**
 
