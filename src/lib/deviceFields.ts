@@ -162,3 +162,35 @@ export function extractDeviceFields(rawText: string, barcodes: string[]): Device
 
   return { sn, imeis, meid, eid }
 }
+
+/** 带 EID/IMEI 等标签前缀的行——那些行印的本来就不是 SN */
+export const NON_SN_LABEL = /EID|IMEI|CMIIT|MEID|MODEL|UPC|EAN/i
+
+/** 抹掉 CMIIT ID、IMEI 等非 SN 字段，防止兜底候选误取 */
+function stripNonSnLabels(text: string): string {
+  return text
+    .replace(/CMIIT[^A-Z0-9]{0,6}(?:ID)?[^A-Z0-9]{0,4}[A-Z0-9]{4,20}/gi, ' ')
+    .replace(/IMEI[^A-Z0-9]{0,6}[A-Z0-9]{6,20}/gi, ' ')
+    .replace(/(?:MEID|EAN|UPC|MODEL|P\/N|PN)[^A-Z0-9]{0,4}[A-Z0-9]{6,20}/gi, ' ')
+}
+
+/** 兜底：无标记时从全文提取疑似 SN 的候选（8~17 位，同时含字母与数字） */
+export function extractSnCandidates(text: string): string[] {
+  const tokens = stripNonSnLabels(text).toUpperCase().split(/[^A-Z0-9]+/)
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const t of tokens) {
+    if (t.length < 8 || t.length > 17) continue
+    if (!/[A-Z]/.test(t) || !/[0-9]/.test(t)) continue
+    if (seen.has(t)) continue
+    seen.add(t)
+    out.push(t)
+  }
+  const score = (s: string) => {
+    let sc = 0
+    if (s.length >= 10 && s.length <= 14) sc += 10
+    sc += Math.min(s.length, 14)
+    return sc
+  }
+  return out.sort((a, b) => score(b) - score(a))
+}

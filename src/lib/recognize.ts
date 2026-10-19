@@ -2,10 +2,16 @@ import { readBarcodes, setZXingModuleOverrides } from 'zxing-wasm/reader'
 import zxingWasmUrl from 'zxing-wasm/reader/zxing_reader.wasm?url'
 import { createWorker, PSM, type Worker } from 'tesseract.js'
 import type { RecognizeOutcome, VerifyStatus } from '@/types'
-import { extractDeviceFields, normalizeSn, extractSnByMarker } from './deviceFields'
+import {
+  extractDeviceFields,
+  normalizeSn,
+  extractSnByMarker,
+  extractSnCandidates,
+  NON_SN_LABEL,
+} from './deviceFields'
 
-// 归一化 / S/N 标记提取已迁至 deviceFields.ts，此处转出保持现有引用可用
-export { normalizeSn, extractSnByMarker }
+// 归一化 / S/N 标记提取 / 候选提取已迁至 deviceFields.ts，此处转出保持现有引用可用
+export { normalizeSn, extractSnByMarker, extractSnCandidates }
 
 setZXingModuleOverrides({
   locateFile: (path: string) => (path.endsWith('.wasm') ? zxingWasmUrl : path),
@@ -13,7 +19,6 @@ setZXingModuleOverrides({
 
 /** 某行 OCR 文本中是否完整包含某个条码值（标记被误读时的保底）。
  *  带 EID/IMEI 等标签前缀的行排除——那些行印的本来就不是 SN */
-const NON_SN_LABEL = /EID|IMEI|CMIIT|MEID|MODEL|UPC|EAN/i
 function containsBarcode(text: string, barcodes: string[]): string | null {
   if (NON_SN_LABEL.test(text)) return null
   const n = normalizeSn(text)
@@ -22,35 +27,6 @@ function containsBarcode(text: string, barcodes: string[]): string | null {
     if (b.length >= 8 && /[A-Z]/.test(b) && /[0-9]/.test(b) && n.includes(b)) return b
   }
   return null
-}
-
-/** 抹掉 CMIIT ID、IMEI 等非 SN 字段，防止兜底候选误取 */
-function stripNonSnLabels(text: string): string {
-  return text
-    .replace(/CMIIT[^A-Z0-9]{0,6}(?:ID)?[^A-Z0-9]{0,4}[A-Z0-9]{4,20}/gi, ' ')
-    .replace(/IMEI[^A-Z0-9]{0,6}[A-Z0-9]{6,20}/gi, ' ')
-    .replace(/(?:MEID|EAN|UPC|MODEL|P\/N|PN)[^A-Z0-9]{0,4}[A-Z0-9]{6,20}/gi, ' ')
-}
-
-/** 兜底：无标记时从全文提取疑似 SN 的候选（8~17 位，同时含字母与数字） */
-export function extractSnCandidates(text: string): string[] {
-  const tokens = stripNonSnLabels(text).toUpperCase().split(/[^A-Z0-9]+/)
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const t of tokens) {
-    if (t.length < 8 || t.length > 17) continue
-    if (!/[A-Z]/.test(t) || !/[0-9]/.test(t)) continue
-    if (seen.has(t)) continue
-    seen.add(t)
-    out.push(t)
-  }
-  const score = (s: string) => {
-    let sc = 0
-    if (s.length >= 10 && s.length <= 14) sc += 10
-    sc += Math.min(s.length, 14)
-    return sc
-  }
-  return out.sort((a, b) => score(b) - score(a))
 }
 
 // ---------------------------------------------------------------- 图像工具
