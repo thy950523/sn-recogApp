@@ -1714,8 +1714,11 @@ async function callServerOcr(
   timeoutMs = 20000,
 ): Promise<ServerOcrResponse | null> {
   if (!serverUrl) return null
-  const upload = scaleForUpload(canvas, 1600)
   try {
+    // 放进 try：scaleForUpload 新建 canvas 并取 2d context，理论上可能抛错。
+    // 本函数的契约是「失败返回 null，由调用方降级」；若它抛出去，recognizeMulti
+    // 的 promise 会直接 reject，调用方还得自己兜 —— 那不是这个函数的契约。
+    const upload = scaleForUpload(canvas, 1600)
     const blob = await new Promise<Blob | null>((resolve) =>
       upload.toBlob(resolve, 'image/jpeg', 0.9),
     )
@@ -1756,6 +1759,12 @@ async function callServerOcr(
  * 位置也是真实的，不涉及合成坐标，标成「仅条码」比「待人工确认」信息量更大。
  *
  * `snBox` 同时置空：合成坐标绝不能拿去画框。
+ *
+ * `barcodeBoxes` 也一并置空。条码**框本身**确实是 zxing 在原图上真实检测到的，
+ * 但**哪个框属于哪台设备**是按合成坐标算出来的，会错配 —— 实测（4 行文本 + 2 个条码）：
+ * 后一台设备吞掉了全部两个框，前一台一个都没有。留着它，界面就会画出一组
+ * 「看起来已经校验过」的归属，比不画更糟。条码的**值**仍在 `barcodes` 里，可供人工核对。
+ * （`barcode_only` 候选不在此列：它只有一个框、且就是它自己的，不受影响。）
  */
 export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
   return devices.map((d) =>
@@ -1766,6 +1775,7 @@ export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
           status: 'pending' as VerifyStatus,
           note: 'OCR 未返回文字坐标，设备配对未经位置校验，请人工核对',
           snBox: null,
+          barcodeBoxes: [],
         },
   )
 }
@@ -1797,7 +1807,8 @@ export async function recognizeMulti(
   onStage?.('正在识别文字…')
   const server = await callServerOcr(canvas, serverUrl)
 
-  if (server && typeof server.text === 'string') {
+  if (server) {
+    const serverText = typeof server.text === 'string' ? server.text : ''
     const lines: OcrLine[] = (server.lines ?? [])
       .filter((l) => l && typeof l.text === 'string' && Array.isArray(l.box) && l.box.length === 4)
       .map((l) => ({
@@ -1806,34 +1817,43 @@ export async function recognizeMulti(
         box: [l.box[0], l.box[1], l.box[2], l.box[3]] as Box4,
       }))
 
+    // 有坐标就用坐标，**与文本是否为空无关** —— 坐标比文本强。
     if (lines.length) {
       return {
         devices: buildCandidates(lines, barcodes),
-        rawText: server.text,
+        rawText: serverText,
         engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
         degraded: false,
         error: null,
       }
     }
 
-    // 服务器有文本但没有坐标（如中转层的 Tesseract 分支）：
+    // 有文本但没有坐标（如中转层的 Tesseract 分支）：
     // 不能因为没坐标就把这段 OCR 文本丢掉，否则 SN/IMEI 信息全没了。
-    // 合成坐标只用于按顺序归组；markUnverified 会置空 snBox（不画框）
+    // 合成坐标只用于按顺序归组；markUnverified 会置空 snBox / barcodeBoxes
     // 并把锚点类候选降为 pending —— 合成坐标算出的配对不可信。
-    const synth: OcrLine[] = server.text
-      .split(/\r?\n/)
-      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
-    return {
-      devices: markUnverified(buildCandidates(synth, barcodes)),
-      rawText: server.text,
-      engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
-      degraded: true,
-      error: 'OCR 未返回文字坐标，已按文本识别，但无法在原图上标注位置',
+    //
+    // 这里判的是 serverText.trim()，**不是** typeof serverText === 'string'：
+    // 服务端返回 200 但文本为空时，若就此 return，本地 Tesseract 兜底就被跳过了。
+    // 而 recognizeSn 在同样情况下会继续回退本地（它判的是真值），
+    // 两条链路对同一输入给出不同结果，是缺陷。文本为空就落到下面的分支 3。
+    if (serverText.trim()) {
+      const synth: OcrLine[] = serverText
+        .split(/\r?\n/)
+        .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
+      return {
+        devices: markUnverified(buildCandidates(synth, barcodes)),
+        rawText: serverText,
+        engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
+        degraded: true,
+        error: 'OCR 未返回文字坐标，已按文本识别，但无法在原图上标注位置',
+      }
     }
   }
 
   // ---- 3. 降级：本地 Tesseract，只有文本没有坐标 ----
   onStage?.('服务器不可用，使用本地 OCR…')
+  let text: string
   try {
     const { preloadOcr, PSM } = await import('./recognize')
     const worker = await preloadOcr()
@@ -1842,25 +1862,20 @@ export async function recognizeMulti(
     // （整图路径用 SPARSE_TEXT，裁切路径用 SINGLE_LINE/SINGLE_BLOCK）。
     // 不显式设置，这里就会继承上一次调用留下的模式，行为随调用顺序变化。
     // SPARSE_TEXT 与 recognizeSn 的整图路径一致，适合一张照片里散落的多个标签。
+    //
+    // 注意：这只解决**顺序**调用。若两个 OCR 流程**并发**跑在同一个 worker 上，
+    // setParameters 与 recognize 是两条独立消息、worker 不串行化，仍会互相覆盖。
+    // 该竞态是既有架构问题（两次并发 recognizeSn 之间同样存在），不在本次范围内，
+    // 已记入「已知风险」。
     await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
     const { data } = await worker.recognize(canvas)
-    const text = data.text ?? ''
-    // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
-    // **绝不能拿去画框**。
-    const lines: OcrLine[] = text
-      .split(/\r?\n/)
-      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
-    return {
-      // 合成坐标是假的：markUnverified 置空 snBox（否则界面会在原图上画出凭空的黄框），
-      // 并把锚点类候选降为 pending（配对是按假坐标算的，不能当成已验证）。
-      // barcodeBoxes 保留：条码是 zxing 在原图上真实检测到的，位置可信。
-      devices: markUnverified(buildCandidates(lines, barcodes)),
-      rawText: text,
-      engine: 'tesseract',
-      degraded: true,
-      error: '服务器 OCR 不可用，已降级本地识别（无法标注位置）',
-    }
-  } catch {
+    text = data.text ?? ''
+  } catch (err) {
+    // try 只包住真正可能失败的那几步（动态 import / worker / recognize）。
+    // buildCandidates 与 markUnverified 是纯函数，**故意留在 try 外**：
+    // 它们若因代码 bug 抛错，应该炸出来，而不是被伪装成「OCR 全部失败，请手动输入」。
+    // 打日志：recognize.ts 的同类失败都有 console.warn，这里不打会让排查无从下手。
+    console.warn('[OCR 本地] 降级识别失败：', err)
     return {
       devices: buildCandidates([], barcodes),
       rawText: '',
@@ -1868,6 +1883,22 @@ export async function recognizeMulti(
       degraded: true,
       error: 'OCR 全部失败，请手动输入',
     }
+  }
+
+  // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
+  // **绝不能拿去画框**。
+  const lines: OcrLine[] = text
+    .split(/\r?\n/)
+    .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
+  return {
+    // 合成坐标是假的：markUnverified 置空 snBox **与 barcodeBoxes**
+    // （前者否则会在原图上画出凭空的黄框；后者框虽真、但归属是假的，见其注释），
+    // 并把锚点类候选降为 pending（配对是按假坐标算的，不能当成已验证）。
+    devices: markUnverified(buildCandidates(lines, barcodes)),
+    rawText: text,
+    engine: 'tesseract',
+    degraded: true,
+    error: '服务器 OCR 不可用，已降级本地识别（无法标注位置）',
   }
 }
 ```
@@ -1921,17 +1952,25 @@ describe('markUnverified', () => {
     ...over,
   })
 
-  it('锚点类候选降为 pending 并清空 snBox（合成坐标不能画框）', () => {
+  const NOTE = 'OCR 未返回文字坐标，设备配对未经位置校验，请人工核对'
+
+  it('锚点类候选降为 pending，并清空 snBox 与 barcodeBoxes', () => {
     const out = markUnverified([
-      cand({ status: 'match', barcode: '8A7C2D1E' }),
-      cand({ status: 'mismatch' }),
+      cand({ status: 'match', barcode: '8A7C2D1E', barcodeBoxes: [[0.1, 0.4, 0.9, 0.44]] }),
+      cand({ status: 'mismatch', barcodeBoxes: [[0.1, 0.6, 0.9, 0.64]] }),
       cand({ status: 'ocr_only' }),
     ])
     // 降级后不能再出现 match/mismatch —— 否则一张好照片会被标成「与条码不一致」，
     // 用户会据此丢掉正确数据
     expect(out.map((d) => d.status)).toEqual(['pending', 'pending', 'pending'])
     expect(out.every((d) => d.snBox === null)).toBe(true)
-    expect(out[0].note).toContain('人工核对')
+    // barcodeBoxes 也要清空：框本身是真的，但「哪个框属于哪台设备」是按合成坐标
+    // 算的、会错配（实测后一台设备吞掉全部框）。留着它，界面就会画出一组
+    // 「看起来已经校验过」的归属。
+    expect(out.every((d) => d.barcodeBoxes.length === 0)).toBe(true)
+    // 断言**全等**而不是 toContain：要锁住 note 是「覆盖」。
+    // 若实现改成在原 note 后面拼接，toContain 仍然会绿。
+    expect(out.every((d) => d.note === NOTE)).toBe(true)
   })
 
   it('barcode_only 保持原样：条码位置是真实检测到的，不涉及合成坐标', () => {
@@ -1945,6 +1984,20 @@ describe('markUnverified', () => {
     })
     expect(markUnverified([b])).toEqual([b])
   })
+
+  it('不修改入参对象，返回的是新对象', () => {
+    // 若有人把 `{ ...d }` 改成原地 `d.status = 'pending'`，上面两条用例**仍会全绿**，
+    // 但实现会开始改到调用方持有的共享对象。这条把它钉住。
+    const input = cand({ status: 'match', barcode: '8A7C2D1E' })
+    const out = markUnverified([input])
+    expect(input.status).toBe('match')
+    expect(input.snBox).toEqual([0.1, 0.1, 0.9, 0.14])
+    expect(out[0]).not.toBe(input)
+  })
+
+  it('空数组返回空数组', () => {
+    expect(markUnverified([])).toEqual([])
+  })
 })
 ```
 
@@ -1954,10 +2007,17 @@ describe('markUnverified', () => {
 npx tsc -b && npx vitest run
 ```
 
-Expected: 无类型错误；**62 passed**（Task 6 修订后的 60 + `markUnverified` 2 条）。
+Expected: 无类型错误；**64 passed**（Task 6 修订后的 60 + `markUnverified` 4 条）。
 
-按本项目标准，这两条也要做**变异验证**：把 `markUnverified` 里 `d.status === 'barcode_only' ? d : {...}`
-的三元分支去掉（一律降级），第二条必须变红；把 `status: 'pending'` 改回 `d.status`，第一条必须变红。
+按本项目标准，这 4 条都要做**变异验证**，每次只改一处、跑完立刻还原：
+
+| 变异 | 必须变红的用例 |
+|---|---|
+| 去掉 `d.status === 'barcode_only' ? d : {...}` 的三元分支（一律降级） | `barcode_only 保持原样` |
+| `status: 'pending' as VerifyStatus` 改回 `status: d.status` | `锚点类候选降为 pending…` |
+| 删掉 `barcodeBoxes: [],` 这一行 | `锚点类候选降为 pending…` |
+| 把 `{ ...d, … }` 改成原地改 `d`（`d.status = 'pending'; d.snBox = null; return d`） | `不修改入参对象` |
+| 把 `note:` 改成拼接而非覆盖（`` `${d.note ?? ''} ${NOTE}` ``） | `锚点类候选降为 pending…`（`=== NOTE` 会红） |
 
 验完要确认还原得**逐字节一致**。做法：变异**之前**先 `cp` 一份快照，还原后 `diff -q` 比对。
 **不要**用 `git diff --stat src/lib/multiRecognize.ts` 判断 —— 这个文件此刻本来就有未提交的改动
@@ -2096,34 +2156,43 @@ export default function MultiResultView({ image, onRetake }: Props) {
         <div className="relative">
           <img src={image.dataUrl} alt="拍摄照片" className="block w-full" />
           {/* 标注层：归一化坐标直接换算成百分比，无需知道显示尺寸 */}
-          {devices.map((d, i) => (
-            <div key={`boxes-${i}`} className="pointer-events-none absolute inset-0">
-              {d.snBox && (
-                <span
-                  className={`absolute border-2 ${
-                    activeIndex === i ? 'border-[#ffc700] bg-[#ffc700]/20' : 'border-[#ffc700]/80'
-                  }`}
-                  style={boxStyle(d.snBox)}
-                />
-              )}
-              {d.barcodeBoxes.map((b, j) => (
-                <span
-                  key={j}
-                  className={`absolute border-2 ${
-                    activeIndex === i ? 'border-[#35d07f] bg-[#35d07f]/20' : 'border-[#35d07f]/70'
-                  }`}
-                  style={boxStyle(b)}
-                />
-              ))}
-              {/* 序号角标 */}
-              <span
-                className="absolute -translate-y-full bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black"
-                style={badgeStyle(d.snBox ?? d.barcodeBoxes[0] ?? [0, 0, 0, 0])}
-              >
-                {i + 1}
-              </span>
-            </div>
-          ))}
+          {devices.map((d, i) => {
+            // 角标锚点：SN 框优先，退到第一个条码框，**都没有就不画**。
+            // 不要用 `?? [0, 0, 0, 0]` 兜底 —— 那会在图片左上角戳出一个凭空的角标，
+            // 而降级模式下 markUnverified 已把 snBox 与 barcodeBoxes 都清空
+            // （ocr_only 这类本来就没有条码框的候选，在降级前也一样会中招）。
+            const badgeAnchor = d.snBox ?? d.barcodeBoxes[0] ?? null
+            return (
+              <div key={`boxes-${i}`} className="pointer-events-none absolute inset-0">
+                {d.snBox && (
+                  <span
+                    className={`absolute border-2 ${
+                      activeIndex === i ? 'border-[#ffc700] bg-[#ffc700]/20' : 'border-[#ffc700]/80'
+                    }`}
+                    style={boxStyle(d.snBox)}
+                  />
+                )}
+                {d.barcodeBoxes.map((b, j) => (
+                  <span
+                    key={j}
+                    className={`absolute border-2 ${
+                      activeIndex === i ? 'border-[#35d07f] bg-[#35d07f]/20' : 'border-[#35d07f]/70'
+                    }`}
+                    style={boxStyle(b)}
+                  />
+                ))}
+                {/* 序号角标 */}
+                {badgeAnchor && (
+                  <span
+                    className="absolute -translate-y-full bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black"
+                    style={badgeStyle(badgeAnchor)}
+                  >
+                    {i + 1}
+                  </span>
+                )}
+              </div>
+            )
+          })}
         </div>
         {!result && !failed && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/70">
@@ -3292,5 +3361,7 @@ superpowers:finishing-a-development-branch 决定合并方式。
 | 条码在水平方向上离自己那台设备的 SN 框太远（如条码贴在机身另一侧、SN 印在正面），二维就近仍可能归给邻居 | 这是几何上真实的歧义，无法靠距离消除；界面逐行可改 SN 与勾选。`MAX_ASSIGN_DISTANCE` 控制条码归属半径 |
 | **文字行（IMEI/EID）被吸进错误设备且不报警**：画面里出现不属于该设备的第二个标签（包装箱、邻机），且它离该设备比离其他设备更近时，会被并入该设备字段；而 status 由「条码 vs SN」算出，仍是 `match`，界面不会标红 | 已评估并**否决**了加距离上限的方案：实测背景行可能就在 0.4 处，0.5 之类的上限挡不住它，却会重新引入「真实 IMEI 被静默丢弃」。任何距离规则都判不出这种歧义。缓解靠人工核对（字段逐行可改）；**需作为已知限制告知用户** |
 | exceljs 与 Vite 的兼容问题（`default` 导出形式） | 代码里已做 `mod.default ?? mod` 兼容；若仍失败，在 `vite.config.ts` 加 `optimizeDeps.include: ['exceljs']` |
+| **本地 OCR 的共享 worker 竞态**：`preloadOcr()` 返回被缓存复用的**同一个** tesseract worker，而 `setParameters` 与 `recognize` 是两条独立消息、worker 不串行化。两个 OCR 流程**并发**时 `pageseg_mode` 会互相覆盖（实测：并发两次 `setParameters` 落在同一份全局状态上） | **既有架构问题，非本次引入** —— 两次并发 `recognizeSn` 之间同样存在，`recognizeMulti` 只是第三个使用者。Task 7 已显式设 `PSM.SPARSE_TEXT`，解决了**顺序**调用；并发需要给共享 worker 加串行化（队列/互斥），属独立改动，会碰核心识别文件，本次不做。影响是「结果可见地变差但原因不可见」，非静默 |
+| `decodeAllBarcodes` 第 1 轮只要读到 ≥1 个条码就直接返回，不再做增强/旋转轮 | 既有行为。一图多码里若一个条码清晰、另一个偏淡，后者永远读不到 → 少识别一台设备。属识别率问题而非正确性问题（少的那台不会以错误数据出现），本次不动 |
 | 缩略图嵌在单元格里，Excel 行高不够会显示不全 | 行高按 `THUMB_MAX_H` 折算设置；导出后需人工抽查一次 |
 | 大量记录导出时内存占用高 | 已加进度提示；超过 200 条时可在界面上提示分批导出 |
