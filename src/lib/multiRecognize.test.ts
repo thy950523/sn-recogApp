@@ -99,6 +99,19 @@ describe('buildCandidates', () => {
     expect(devices[1].status).toBe('ocr_only')
   })
 
+  it('条码离所有 S/N 行都超出阈值时，补一条 barcode_only 以免漏登记', () => {
+    const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14)]
+    // 条码中心 0.90，距锚点中心 0.12 有 0.78，远超 MAX_ASSIGN_DISTANCE(0.25)
+    const barcodes = [bar('9B8D3E2F', 0.88, 0.92)]
+    const devices = buildCandidates(lines, barcodes)
+    expect(devices).toHaveLength(2)
+    expect(devices[0].sn).toBe('8A7C2D1E')
+    expect(devices[0].status).toBe('ocr_only')
+    expect(devices[1].sn).toBe('9B8D3E2F')
+    expect(devices[1].status).toBe('barcode_only')
+    expect(devices[1].barcodeBoxes).toEqual([[0.1, 0.88, 0.9, 0.92]])
+  })
+
   it('按纵向顺序返回，与输入顺序无关', () => {
     const lines = [line('S/N: 9B8D3E2F', 0.60, 0.64), line('S/N: 8A7C2D1E', 0.10, 0.14)]
     const devices = buildCandidates(lines, [])
