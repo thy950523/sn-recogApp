@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react'
 import ScanView from '@/sections/ScanView'
-import ResultView from '@/sections/ResultView'
+import MultiResultView from '@/sections/MultiResultView'
+import type { ImagePayload } from '@/sections/MultiResultView'
 import RecordsView from '@/sections/RecordsView'
 import ContinuousScanView from '@/sections/ContinuousScanView'
 import { useRecords } from '@/lib/store'
@@ -8,24 +9,24 @@ import type { SnRecord } from '@/types'
 
 type Screen =
   | { name: 'scan' }
-  | { name: 'result'; image: string; key: number }
+  | { name: 'multi'; image: ImagePayload; key: number }
   | { name: 'records' }
   | { name: 'continuous' }
 
 export default function Home() {
-  const { records, add, remove, clear } = useRecords()
+  const { records, addMany, remove, clear } = useRecords()
   const [screen, setScreen] = useState<Screen>({ name: 'scan' })
 
-  const handleShot = useCallback((image: string) => {
-    setScreen({ name: 'result', image, key: Date.now() })
+  const handleShot = useCallback((image: ImagePayload) => {
+    setScreen({ name: 'multi', image, key: Date.now() })
   }, [])
 
   const handleRegister = useCallback(
-    (r: Omit<SnRecord, 'id' | 'time'>) => {
-      add(r)
+    (list: Omit<SnRecord, 'id' | 'time'>[]) => {
+      addMany(list)
       setScreen({ name: 'scan' })
     },
-    [add],
+    [addMany],
   )
 
   const handleRetake = useCallback(() => setScreen({ name: 'scan' }), [])
@@ -38,16 +39,24 @@ export default function Home() {
   if (screen.name === 'continuous') {
     return <ContinuousScanView onClose={() => setScreen({ name: 'scan' })} />
   }
-  if (screen.name === 'result') {
+  if (screen.name === 'multi') {
     return (
-      <ResultView
+      <MultiResultView
         key={screen.key}
         image={screen.image}
-        records={records}
+        existingSns={records.map((r) => r.sn)}
         onRetake={handleRetake}
         onRegister={handleRegister}
+        imageId={null}
       />
     )
   }
-  return <ScanView count={records.length} onShot={handleShot} onOpenRecords={openRecords} setScreen={(s) => setScreen(s as Screen)} />
+  return (
+    <ScanView
+      count={records.length}
+      onShot={handleShot}
+      onOpenRecords={openRecords}
+      setScreen={(s) => setScreen(s as Screen)}
+    />
+  )
 }

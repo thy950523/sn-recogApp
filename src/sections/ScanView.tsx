@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { preloadOcr } from '@/lib/recognize'
+import type { ImagePayload } from './MultiResultView'
 
 interface Props {
   count: number
-  onShot: (imageDataUrl: string) => void
+  onShot: (image: ImagePayload) => void
   onOpenRecords: () => void
   setScreen: (screen: { name: string }) => void
 }
 
 /** 将视频当前帧绘制到 canvas（限制最长边 1600px，兼顾精度与速度）并导出 JPEG */
-function captureFrame(video: HTMLVideoElement): string | null {
+function captureFrame(video: HTMLVideoElement): ImagePayload | null {
   const vw = video.videoWidth
   const vh = video.videoHeight
   if (!vw || !vh) return null
@@ -22,7 +23,7 @@ function captureFrame(video: HTMLVideoElement): string | null {
   const ctx = canvas.getContext('2d')
   if (!ctx) return null
   ctx.drawImage(video, 0, 0, w, h)
-  return canvas.toDataURL('image/jpeg', 0.9)
+  return { dataUrl: canvas.toDataURL('image/jpeg', 0.9), width: w, height: h }
 }
 
 export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Props) {
@@ -130,7 +131,7 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
           canvas.height = h
           canvas.getContext('2d')!.drawImage(img, 0, 0, w, h)
           stopCamera()
-          onShot(canvas.toDataURL('image/jpeg', 0.9))
+          onShot({ dataUrl: canvas.toDataURL('image/jpeg', 0.9), width: w, height: h })
         }
         img.onerror = () =>
           setLoadError('照片格式无法解析。若使用 iPhone，请在 设置→相机→格式 中选用「兼容性最佳」。')
