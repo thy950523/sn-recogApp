@@ -12,6 +12,32 @@ interface Props {
 export default function RecordsView({ records, onBack, onRemove, onClear }: Props) {
   const [copied, setCopied] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
+  /** null = 未在导出；否则是当前进度 */
+  const [excelProgress, setExcelProgress] = useState<{ done: number; total: number } | null>(null)
+  /** 导出结果提示（图片缺失时必须说出来，不能静默） */
+  const [excelNote, setExcelNote] = useState<string | null>(null)
+
+  const handleExportExcel = async () => {
+    if (excelProgress) return
+    setExcelNote(null)
+    setExcelProgress({ done: 0, total: 0 })
+    try {
+      // 动态 import：exceljs 约 1MB，不能拖进首屏
+      const { exportExcel } = await import('@/lib/exportExcel')
+      const res = await exportExcel(records, (done, total) => setExcelProgress({ done, total }))
+      setExcelNote(
+        res.skipped > 0
+          ? `已导出 ${res.total} 条，其中 ${res.skipped} 条图片已丢失，缩略图列留空`
+          : `已导出 ${res.total} 条`,
+      )
+    } catch (err) {
+      // 导出失败必须可见：静默失败会让用户以为表格已经存好了
+      console.warn('[Excel 导出] 失败：', err)
+      setExcelNote('导出失败，请重试')
+    } finally {
+      setExcelProgress(null)
+    }
+  }
 
   const warningRecords = records.filter(
     (r): r is ContinuousScanRecord => (r as ContinuousScanRecord).verifyStatus === 'warning',
@@ -90,6 +116,20 @@ export default function RecordsView({ records, onBack, onRemove, onClear }: Prop
 
       {/* 底部导出区 */}
       <footer className="border-t border-[#1a1a1a] px-5 pt-4 pb-[max(env(safe-area-inset-bottom),20px)]">
+        {excelNote && (
+          <p className="mb-2 font-mono text-[11px] text-[#84898e]">{excelNote}</p>
+        )}
+        <button
+          onClick={handleExportExcel}
+          disabled={!records.length || !!excelProgress}
+          className="mb-2 w-full bg-[#ffc700] py-3.5 font-mono text-sm font-bold tracking-[0.2em] text-black uppercase active:bg-[#e0af00] disabled:bg-[#2a2a2a] disabled:text-[#666]"
+        >
+          {excelProgress
+            ? excelProgress.total > 0
+              ? `导出中 ${excelProgress.done}/${excelProgress.total}`
+              : '导出中…'
+            : '导出 Excel（含图片）'}
+        </button>
         <div className="grid grid-cols-2 gap-2">
           <button
             onClick={() => exportCsv(records)}
