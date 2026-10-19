@@ -83,7 +83,25 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
           streamRef.current = stream
           if (videoRef.current) {
             videoRef.current.srcObject = stream
-            await videoRef.current.play().catch(() => {})
+            try {
+              await videoRef.current.play()
+            } catch {
+              // play() 失败（浏览器拒绝自动播放、相机被其他应用占用等）时画面不会有任何帧，
+              // 于是 captureFrame 必然拿到 videoWidth===0 而返回 null —— 用户点「拍照识别」将毫无反应。
+              // 不能吞这个错：设置 cameraError 一举两得 —— 它渲染全屏提示浮层说明原因，
+              // 又把底部按钮从 handleShutter 切到系统相机，用户不再撞在死路径上。
+              if (cancelled) {
+                stream.getTracks().forEach((t) => t.stop())
+                return
+              }
+              // 停掉已拿到的 track：play() 失败意味着预览永远不会有帧，留着这些 track
+              // 只会让摄像头一直亮着（黑屏但相机开着），徒耗电量与隐私指示灯。
+              stream.getTracks().forEach((t) => t.stop())
+              streamRef.current = null
+              setCameraError('无法启动相机实时预览，可能被其他应用占用或浏览器禁止自动播放。')
+              // 直接退出重试循环：play() 失败通常是自动播放策略问题，重试一次不会变好。
+              return
+            }
           }
           setCameraError(null)
           return
