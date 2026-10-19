@@ -2161,24 +2161,36 @@ git commit -m "feat(image): 拍照后压缩存入 IndexedDB，登记记录关联
 
 **Step 1: 加缩略图组件**
 
+> **修订（Task 4 执行后）**：原设计让每行 `Thumb` 在卸载时调用 `releaseImageUrl(imageId)`。
+> 一图多码下**一张照片被多行共用**同一个 `imageId` → 同一 Object URL。删掉其中一行时，
+> 该行卸载会 revoke 掉其余行仍在渲染的 URL，它们的 `<img>` 立刻变空白，且 `imageId`
+> 未变、effect 不会重跑，不会自愈。
+> 改为：**行级只登记、不释放**；`RecordsView` 卸载时统一释放一次。
+> 被删空的图片本身由 `remove()` → `orphanedImageIds` → `deleteImages` 负责释放。
+
 在 `RecordsView.tsx` 里新增一个内部组件（放在文件底部）：
 
 ```tsx
-/** 记录缩略图：异步从 IndexedDB 取图，卸载时释放 Object URL */
-function Thumb({ imageId }: { imageId?: string }) {
+/**
+ * 记录缩略图：异步从 IndexedDB 取图。
+ * 释放由 RecordsView 在卸载时统一进行 —— 不能在这里卸载时释放：
+ * 一图多码下一张照片被多行共用同一个 Object URL，单行卸载会 revoke 掉
+ * 其它行仍在渲染的 URL（它们的 imageId 没变，effect 不会重跑，不会自愈）。
+ */
+function Thumb({ imageId, onUse }: { imageId?: string; onUse: (id: string) => void }) {
   const [url, setUrl] = useState<string | null>(null)
 
   useEffect(() => {
     if (!imageId) return
+    onUse(imageId)
     let alive = true
     getImageUrl(imageId).then((u) => {
       if (alive) setUrl(u)
     })
     return () => {
       alive = false
-      releaseImageUrl(imageId)
     }
-  }, [imageId])
+  }, [imageId, onUse])
 
   if (!imageId) {
     return (
@@ -2198,8 +2210,25 @@ function Thumb({ imageId }: { imageId?: string }) {
 顶部导入：
 
 ```tsx
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { estimateUsage, getImageUrl, releaseImageUrl } from '@/lib/imageStore'
+```
+
+在 `RecordsView` 组件内加统一释放：
+
+```tsx
+  // 记录本视图用到的图片 id，卸载时统一释放。依赖必须是空数组：
+  // 若把 records 放进依赖，每次记录变化都会 revoke 掉仍在显示的行所用的 URL。
+  const usedImageIds = useRef(new Set<string>())
+  const trackImage = useCallback((id: string) => {
+    usedImageIds.current.add(id)
+  }, [])
+  useEffect(
+    () => () => {
+      for (const id of usedImageIds.current) releaseImageUrl(id)
+    },
+    [],
+  )
 ```
 
 **Step 2: 列表行加缩略图**
