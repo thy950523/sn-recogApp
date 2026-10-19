@@ -155,11 +155,13 @@ export function extractDeviceFields(rawText: string, barcodes: string[]): Device
   }
 
   // 排序：IMEI1（槽位 1）在前、IMEI2（槽位 2）在后。
-  // 未标槽位（slot=null）的 IMEI 必须按出现顺序补进空闲槽位，而不能直接排在已知槽位之后：
+  // 未标槽位（slot=null）的 IMEI 按出现顺序补进空闲槽位，而不是直接排在已知槽位之后：
   // 机身常见的「IMEI: xxx」+「IMEI2: yyy」排版里，第一行标签没印槽位数字，slot 为 null。
-  // 若让 null 排在槽位 2 之后，multiRecognize 按下标取 imei/imei2 时会把物理标签为 IMEI2 的
-  // 值填进 imei 字段、反之亦然 —— 两个字段的标签整体写反，且多码确认页里这两格是只读文本，
-  // 用户无法手工修正。补号后「未标槽位」自然落进槽位 1，与物理标签一致。
+  // 补槽位与排序仍然必要，作用有二：① 不丢值 —— 让「未标槽位的那条」也能被槽位 1 取到；
+  // ② 顺序确定 —— 数组顺序与物理标签一致，展示时不会忽前忽后。
+  // 但字段归属**由 imeiBySlot 按槽位决定，不再依赖数组下标**：因此即便槽位 1 整个缺席
+  // （机身只印了 IMEI2、或 OCR 漏读 IMEI1 那行），imeiBySlot(imeis, 1) 也会如实返回 null，
+  // 而不是把 IMEI2 的值按下标误填进 imei 字段。
   // 槽位号只有 1、2 两个（对应 IMEI1/IMEI2）；两个都被占用时（如三个 IMEI）保持 null 排最后。
   const usedSlots = new Set<number>()
   for (const f of imeis) if (f.slot !== null) usedSlots.add(f.slot)
@@ -177,6 +179,17 @@ export function extractDeviceFields(rawText: string, barcodes: string[]): Device
   })
 
   return { sn, imeis: ranked, meid, eid }
+}
+
+/**
+ * 按槽位取 IMEI 值。消费侧一律走这里，**不要**用 `imeis[0]` / `imeis[1]`。
+ *
+ * 数组虽然按槽位排过序，但**槽位 1 可能整个缺席**（机身只印了 IMEI2，或 OCR 漏读了
+ * IMEI1 那行），此时 imeis[0].slot === 2，按下标取会把 IMEI2 的值填进 imei 字段、
+ * imei2 留空 —— 两个字段的标签整体写反，而确认页里这两格是只读文本，用户无法手工修正。
+ */
+export function imeiBySlot(imeis: readonly ImeiField[], slot: 1 | 2): string | null {
+  return imeis.find((f) => f.slot === slot)?.value ?? null
 }
 
 /** 带 EID/IMEI 等标签前缀的行——那些行印的本来就不是 SN */

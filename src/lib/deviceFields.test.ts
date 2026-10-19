@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { extractDeviceFields, extractSnByMarker } from './deviceFields'
+import { extractDeviceFields, extractSnByMarker, imeiBySlot } from './deviceFields'
 import { snFromLine } from './multiRecognize'
+import type { ImeiField } from '@/types'
 
 /** 取 imeis 的 value 序列，便于断言顺序 */
 const values = (text: string) => extractDeviceFields(text, []).imeis.map((f) => f.value)
@@ -56,6 +57,43 @@ describe('extractDeviceFields / IMEI 槽位', () => {
     ].join('\n')
     expect(slots(text)).toEqual([1, 2, null])
     expect(values(text)[2]).toBe('860123456789038')
+  })
+})
+
+describe('imeiBySlot（按槽位取值，不按下标）', () => {
+  const f = (value: string, slot: number | null): ImeiField => ({
+    value,
+    matchedBarcode: null,
+    slot,
+  })
+
+  it('槽位 1 有值时返回它', () => {
+    expect(imeiBySlot([f('111', 1)], 1)).toBe('111')
+  })
+
+  it('槽位 2 有值时返回它', () => {
+    expect(imeiBySlot([f('222', 2)], 2)).toBe('222')
+  })
+
+  it('两个槽位都有时各取各的', () => {
+    const imeis = [f('111', 1), f('222', 2)]
+    expect(imeiBySlot(imeis, 1)).toBe('111')
+    expect(imeiBySlot(imeis, 2)).toBe('222')
+  })
+
+  it('两个槽位都无时都返回 null（空数组、或只剩 slot=null 的条目）', () => {
+    expect(imeiBySlot([], 1)).toBeNull()
+    expect(imeiBySlot([], 2)).toBeNull()
+    expect(imeiBySlot([f('333', null)], 1)).toBeNull()
+    expect(imeiBySlot([f('333', null)], 2)).toBeNull()
+  })
+
+  it('只有槽位 2（槽位 1 整个缺席）时：取 1 返回 null、取 2 返回值', () => {
+    // 核心：数组只有一条且 slot===2。若实现改成按下标取（如 imeis[slot-1]），
+    // 取槽位 1 会返回这条值 —— 正是要根治的「两个字段标签整体写反」。
+    const imeis = [f('222', 2)]
+    expect(imeiBySlot(imeis, 1)).toBeNull()
+    expect(imeiBySlot(imeis, 2)).toBe('222')
   })
 })
 

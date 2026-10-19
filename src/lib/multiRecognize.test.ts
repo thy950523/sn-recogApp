@@ -214,6 +214,20 @@ describe('buildCandidates', () => {
     expect(d.imei).toBe('356938035643809')
   })
 
+  it('机身只印 IMEI2（槽位 1 整个缺席）时，值进 imei2 而不是 imei', () => {
+    // 槽位 1 缺席（机身只印 IMEI2，或 OCR 漏读了 IMEI1 那行）：imeis 只有一条且
+    // slot===2。若消费侧按下标取（imeis[0]），这条会被填进 imei 字段、imei2 留空 ——
+    // 两个字段的标签整体写反，而多码确认页里这两格是只读文本，用户无法手工修正。
+    // 修复前本用例会红：imei 拿到值、imei2 为 null。
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.10, 0.14),
+      line('IMEI2 356938035643999', 0.15, 0.19),
+    ]
+    const [d] = buildCandidates(lines, [])
+    expect(d.imei).toBeNull()
+    expect(d.imei2).toBe('356938035643999')
+  })
+
   it('同一 S/N 重复出现时只保留一条', () => {
     const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14), line('S/N: 8A7C2D1E', 0.30, 0.34)]
     expect(buildCandidates(lines, [])).toHaveLength(1)

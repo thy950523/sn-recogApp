@@ -14,6 +14,7 @@ import {
   extractDeviceFields,
   extractSnByMarker,
   extractSnCandidates,
+  imeiBySlot,
   NON_SN_LABEL,
 } from './deviceFields'
 import { assignNearest, boxCenterY, normalizeBox, type Box4 } from './deviceBoxes'
@@ -164,8 +165,10 @@ export function buildCandidates(
       sn,
       barcode: matched,
       barcodes: allBarcodeValues,
-      imei: fields.imeis[0]?.value ?? null,
-      imei2: fields.imeis[1]?.value ?? null,
+      // 按槽位取，不按下标：槽位 1 可能整个缺席（机身只印 IMEI2 / OCR 漏读 IMEI1），
+      // 此时 imeis[0].slot === 2，按下标取会把 IMEI2 的值误填进 imei 字段。
+      imei: imeiBySlot(fields.imeis, 1),
+      imei2: imeiBySlot(fields.imeis, 2),
       meid: fields.meid?.value ?? null,
       eid: fields.eid?.value ?? null,
       rawOcr: regionText,
