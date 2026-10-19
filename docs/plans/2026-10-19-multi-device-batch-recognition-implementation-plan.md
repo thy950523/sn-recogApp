@@ -1740,7 +1740,7 @@ async function callServerOcr(
   }
 }
 
-// 这里没有复用 recognize.ts 里已有的 runServerOcr（第 289 行），原因有二，都是硬约束：
+// 这里没有复用 recognize.ts 里已有的 runServerOcr，原因有二，都是硬约束：
 //   1. multiRecognize.ts 不能静态 import './recognize'（它顶层加载 tesseract.js 与 zxing-wasm，
 //      会打断 Node 单测）；把 runServerOcr 搬出来又要新建模块、改动核心识别文件，风险大于收益。
 //   2. 两者需求不同：recognizeSn 要把整图按 0.92 质量原样上传（标签字小，不能再降采样）；
@@ -1958,7 +1958,10 @@ Expected: 无类型错误；**62 passed**（Task 6 修订后的 60 + `markUnveri
 
 按本项目标准，这两条也要做**变异验证**：把 `markUnverified` 里 `d.status === 'barcode_only' ? d : {...}`
 的三元分支去掉（一律降级），第二条必须变红；把 `status: 'pending'` 改回 `d.status`，第一条必须变红。
-验完还原，`git diff --stat src/lib/multiRecognize.ts` 应为空。
+
+验完要确认还原得**逐字节一致**。做法：变异**之前**先 `cp` 一份快照，还原后 `diff -q` 比对。
+**不要**用 `git diff --stat src/lib/multiRecognize.ts` 判断 —— 这个文件此刻本来就有未提交的改动
+（Step 0 的注释 + Step 2 的主入口），`git diff` 恒非空，那个判据不成立。
 
 **Step 5: 说明本步的验证边界**
 
@@ -1973,7 +1976,9 @@ Expected: 无类型错误；**62 passed**（Task 6 修订后的 60 + `markUnveri
 **Step 6: Commit**
 
 ```bash
-git add src/lib/multiRecognize.ts src/lib/recognize.ts src/lib/deviceBoxes.ts
+# 四个文件一起提交：Step 3 改的测试文件必须跟进来，
+# 否则源码与它的用例被拆到两个提交里，中间那次提交的测试是假的。
+git add src/lib/multiRecognize.ts src/lib/recognize.ts src/lib/deviceBoxes.ts src/lib/multiRecognize.test.ts
 git commit -m "feat(multi): 识别主入口，接 zxing 条码与服务端 OCR，含本地降级"
 ```
 
