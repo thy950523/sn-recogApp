@@ -86,11 +86,20 @@ describe('buildManyRecords', () => {
   })
 
   it('同毫秒批量（显式注入同一个 now）时 id 仍互不相同', () => {
-    // 这是最容易写错、也最该被钉住的一点：若 id 只用 now 而不带批内下标 i，
-    // 同一 now 下 3 条记录的 id 会完全相同。
+    // 批内唯一性主要由随机后缀提供（i 只钉住序号，不保证唯一）。
+    // 这里断言的是结果：同一 now 下 3 条 id 两两不同。
     const created = buildManyRecords([entry('SN-A'), entry('SN-B'), entry('SN-C')], 12345)
     const ids = created.map((r) => r.id)
     expect(new Set(ids).size).toBe(3)
+  })
+
+  it('id 带确定性的批内序号 i：第 i 条以 `${now}-${i}-` 开头', () => {
+    // 唯一性主要由随机后缀提供；但 i 是**确定性的批内序号** —— 即使随机后缀退化或
+    // 碰撞，同一批内也不会重号。这条把 i 钉住：若把 id 模板改成 `${now}-${rand}`
+    // （只去掉 `-${i}-`、保留随机后缀），本用例会红（不再以 `${1000}-${i}-` 开头）。
+    // 不断言完整 id：随机后缀不可预测。
+    const created = buildManyRecords([entry('SN-A'), entry('SN-B'), entry('SN-C')], 1000)
+    created.forEach((r, i) => expect(r.id.startsWith(`${1000}-${i}-`)).toBe(true))
   })
 
   it('默认 now 取自当前时钟（不注入时用 Date.now()）', () => {
