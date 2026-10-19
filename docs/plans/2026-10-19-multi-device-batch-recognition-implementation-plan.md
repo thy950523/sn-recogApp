@@ -1108,10 +1108,21 @@ Expected: FAIL —— 找不到模块 `./multiRecognize`。
 把 `src/lib/recognize.ts:16-54` 的 `NON_SN_LABEL`、`stripNonSnLabels`、`extractSnCandidates`
 **整体剪切**到 `src/lib/deviceFields.ts` 末尾（注释原样保留）。
 
+> **注意（执行前更正）**：`NON_SN_LABEL` 必须改成 `export const`，因为 `recognize.ts:17-25` 的
+> `containsBarcode` **仍在使用它**（`containsBarcode` 留在 recognize.ts 不动）。
+> 下面的替换导入行必须带上 `NON_SN_LABEL`，否则 `tsc -b` 会报未定义。
+> `multiRecognize.ts` 也改为从这里导入，不要重复声明同一正则。
+
 然后在 `recognize.ts` 顶部把原来的导入行改为转出：
 
 ```ts
-import { extractDeviceFields, normalizeSn, extractSnByMarker, extractSnCandidates } from './deviceFields'
+import {
+  extractDeviceFields,
+  normalizeSn,
+  extractSnByMarker,
+  extractSnCandidates,
+  NON_SN_LABEL,
+} from './deviceFields'
 
 // 归一化 / S/N 标记提取 / 候选提取已迁至 deviceFields.ts，此处转出保持现有引用可用
 export { normalizeSn, extractSnByMarker, extractSnCandidates }
@@ -1143,7 +1154,12 @@ Expected: `ContinuousScanView.tsx` 等处的引用仍能解析，类型检查与
  * 纯函数部分（buildCandidates / snFromLine）与网络、DOM 无关，可离线单测。
  */
 
-import { extractDeviceFields, extractSnByMarker, extractSnCandidates } from './deviceFields'
+import {
+  extractDeviceFields,
+  extractSnByMarker,
+  extractSnCandidates,
+  NON_SN_LABEL,
+} from './deviceFields'
 import { assignByNearestY, boxCenterY, type Box4 } from './deviceBoxes'
 import type { VerifyStatus } from '@/types'
 
@@ -1185,8 +1201,8 @@ export interface DeviceCandidate {
 /** 归类距离上限（归一化纵向距离）。设备摆得再开，一屏内也远小于 0.25 */
 const MAX_ASSIGN_DISTANCE = 0.25
 
-/** 非 SN 标签行，防止把 IMEI/EID 行当成 SN */
-const NON_SN_LABEL = /EID|IMEI|CMIIT|MEID|MODEL|UPC|EAN/i
+// 非 SN 标签行（EID/IMEI/…）的判断统一用 deviceFields 导出的 NON_SN_LABEL，
+// 避免与 recognize.ts 里的同一正则各写一份、日后改一处漏一处。
 
 /**
  * 从一行 OCR 文本里取 SN：优先 S/N 标记，其次疑似 SN 的字母数字混合串。
