@@ -990,8 +990,9 @@ export function pointToBoxDistance(px: number, py: number, box: Box4): number {
  * 等距时取下标较小的锚点，保证结果稳定。
  * 前提：anchors 按中心 y 升序传入时，「下标较小」才等价于「几何上靠上」。
  *
- * maxDistance 传 Infinity 表示「不设上限、最近者得」——用于 OCR 文字行：
- * 丢掉一行等于静默丢失一个 IMEI，比归错（界面上可见、可改）更糟。
+ * maxDistance 传 Infinity 表示「不设上限、最近者得」——用于 OCR 文字行。
+ * 这是两害相权的选择，理由见 multiRecognize.buildCandidates 第 2 段的注释：
+ * 文字行设上限会静默丢弃 IMEI/EID，不设上限会让远处背景行被吸进来且**不报警**。
  */
 export function assignNearest(
   items: BoxedItem[],
@@ -1423,9 +1424,18 @@ export function buildCandidates(
   // ---- 2. 条码归到最近的锚点；无锚点时每个条码自成一条 ----
   const barcodeOwner = assignNearest(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
   // 行归属：同样按二维就近归到锚点（锚点自身距离为 0，必然归给自己）。
-  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**：
-  // 一行没归到任何设备 = 静默丢掉一个 IMEI/EID，比归错（界面上看得见、能改）更糟。
-  // 条码则相反：画面里可能有不属于任何设备的条码（包装箱上的码），所以要设上限。
+  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**。这是两害相权，没有哪个常数
+  // 能把两种失败分开：
+  //   · 设上限：超限的 IMEI/EID 被丢弃 → 字段空着（看得见），但大设备占满画面、
+  //     IMEI 行离 SN 行 0.4 以上时会被误丢（实测复现）。
+  //   · 不设上限：远处背景行（包装箱/邻机上的另一个 IMEI 标签）被吸进来 → 字段填错，
+  //     而且**不报警**：status 由「条码 vs SN」算出，吸错 IMEI 不会让它变 mismatch，
+  //     候选照样是 match。这与「归错在界面上看得见」的直觉相反，是实测结论。
+  // 选 Infinity：设个 0.5 之类的上限并不能可靠挡住背景行（它可能就在 0.4 处），
+  // 却会重新引入丢弃 —— 花了丢弃的代价，没买到防串台的收益。
+  // 剩下的真歧义（某个不属于本设备的标签，离本设备比离其他设备都近）任何距离规则
+  // 都判不出来，只能靠人工核对。条码不同：有 zxing 的真实坐标、且画面里常有与设备
+  // 无关的码，所以要设上限。
   const lineOwner = assignNearest(lines, anchorBoxes, Infinity)
 
   // 未被任何锚点认领、但值与某个锚点 SN 相同的条码：直接归给那个锚点。
@@ -1591,8 +1601,46 @@ git commit -m "feat(multi): 一图多码候选构建（S/N 锚点 + 条码就近
 ## Task 7: 识别主入口（接 zxing + 服务端 OCR）
 
 **Files:**
-- Modify: `src/lib/multiRecognize.ts`（追加主入口）
+- Modify: `src/lib/multiRecognize.ts`（追加主入口；并订正一处已知不成立的注释）
 - Modify: `src/lib/recognize.ts`（导出一个可复用的整图条码扫描函数）
+- Modify: `src/lib/deviceBoxes.ts`（订正 `assignNearest` 文档注释里一处已知不成立的说明）
+
+**Step 0: 先订正两条已知不成立的注释（纯注释改动）**
+
+上一轮复审**实测推翻了**这两处注释给出的理由。必须改掉：留着它，下一个读代码的人会照着错的理由做决定。
+两处都只改注释、不动任何逻辑。
+
+`src/lib/deviceBoxes.ts` 中 `assignNearest` 文档注释的末尾：
+
+```ts
+ * maxDistance 传 Infinity 表示「不设上限、最近者得」——用于 OCR 文字行。
+ * 这是两害相权的选择，理由见 multiRecognize.buildCandidates 第 2 段的注释：
+ * 文字行设上限会静默丢弃 IMEI/EID，不设上限会让远处背景行被吸进来且**不报警**。
+ */
+```
+
+`src/lib/multiRecognize.ts` 中 `lineOwner` 上方那段。原话写的是「比归错（界面上看得见、能改）更糟」，
+但实测**归错看不见** —— status 由「条码 vs SN」算出，吸进一个外来的 IMEI 不会让它变 `mismatch`：
+
+```ts
+  // 行归属：同样按二维就近归到锚点（锚点自身距离为 0，必然归给自己）。
+  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**。这是两害相权，没有哪个常数
+  // 能把两种失败分开：
+  //   · 设上限：超限的 IMEI/EID 被丢弃 → 字段空着（看得见），但大设备占满画面、
+  //     IMEI 行离 SN 行 0.4 以上时会被误丢（实测复现）。
+  //   · 不设上限：远处背景行（包装箱/邻机上的另一个 IMEI 标签）被吸进来 → 字段填错，
+  //     而且**不报警**：status 由「条码 vs SN」算出，吸错 IMEI 不会让它变 mismatch，
+  //     候选照样是 match。这与「归错在界面上看得见」的直觉相反，是实测结论。
+  // 选 Infinity：设个 0.5 之类的上限并不能可靠挡住背景行（它可能就在 0.4 处），
+  // 却会重新引入丢弃 —— 花了丢弃的代价，没买到防串台的收益。
+  // 剩下的真歧义（某个不属于本设备的标签，离本设备比离其他设备都近）任何距离规则
+  // 都判不出来，只能靠人工核对。条码不同：有 zxing 的真实坐标、且画面里常有与设备
+  // 无关的码，所以要设上限。
+  const lineOwner = assignNearest(lines, anchorBoxes, Infinity)
+```
+
+改完跑 `npx tsc -b && npx vitest run`，应仍是 **60 passed** —— 注释不影响行为，
+这一跑只是为了确认没有手滑改到代码。
 
 **Step 1: 在 `recognize.ts` 导出条码扫描**
 
@@ -1925,7 +1973,7 @@ Expected: 无类型错误；**62 passed**（Task 6 修订后的 60 + `markUnveri
 **Step 6: Commit**
 
 ```bash
-git add src/lib/multiRecognize.ts src/lib/recognize.ts
+git add src/lib/multiRecognize.ts src/lib/recognize.ts src/lib/deviceBoxes.ts
 git commit -m "feat(multi): 识别主入口，接 zxing 条码与服务端 OCR，含本地降级"
 ```
 
@@ -3236,7 +3284,8 @@ superpowers:finishing-a-development-branch 决定合并方式。
 | 风险 | 应对 |
 |---|---|
 | **（已修）** 横构图下设备左右并排、锚点中心 y 几乎相同，只看 y 会整片串台（条码全归一台、IMEI 挂错设备、其余 IMEI 静默丢失） | `assignNearest` 改用「条目中心 → 锚点框」的二维最短距离；4 条回归用例锁住（见 Task 6） |
-| 条码在水平方向上离自己那台设备的 SN 框太远（如条码贴在机身另一侧、SN 印在正面），二维就近仍可能归给邻居 | 这是几何上真实的歧义，无法靠距离消除；界面逐行可改 SN 与勾选。`MAX_ASSIGN_DISTANCE` 控制条码归属半径（文字行不设上限，宁可归错也不静默丢弃） |
+| 条码在水平方向上离自己那台设备的 SN 框太远（如条码贴在机身另一侧、SN 印在正面），二维就近仍可能归给邻居 | 这是几何上真实的歧义，无法靠距离消除；界面逐行可改 SN 与勾选。`MAX_ASSIGN_DISTANCE` 控制条码归属半径 |
+| **文字行（IMEI/EID）被吸进错误设备且不报警**：画面里出现不属于该设备的第二个标签（包装箱、邻机），且它离该设备比离其他设备更近时，会被并入该设备字段；而 status 由「条码 vs SN」算出，仍是 `match`，界面不会标红 | 已评估并**否决**了加距离上限的方案：实测背景行可能就在 0.4 处，0.5 之类的上限挡不住它，却会重新引入「真实 IMEI 被静默丢弃」。任何距离规则都判不出这种歧义。缓解靠人工核对（字段逐行可改）；**需作为已知限制告知用户** |
 | exceljs 与 Vite 的兼容问题（`default` 导出形式） | 代码里已做 `mod.default ?? mod` 兼容；若仍失败，在 `vite.config.ts` 加 `optimizeDeps.include: ['exceljs']` |
 | 缩略图嵌在单元格里，Excel 行高不够会显示不全 | 行高按 `THUMB_MAX_H` 折算设置；导出后需人工抽查一次 |
 | 大量记录导出时内存占用高 | 已加进度提示；超过 200 条时可在界面上提示分批导出 |
