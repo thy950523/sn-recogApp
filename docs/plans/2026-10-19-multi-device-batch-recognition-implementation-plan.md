@@ -368,6 +368,13 @@ function withStore<T>(
           // fn 可能同步抛错（如 put 非可克隆值时的 DataCloneError）
           req = fn(tx.objectStore(STORE))
         } catch (err) {
+          // 同步抛错时事务里可能已排入部分写操作，必须 abort 回滚，
+          // 否则调用方收到 reject、数据却已部分生效
+          try {
+            tx.abort()
+          } catch {
+            /* 事务可能已结束 */
+          }
           fail(err)
           return
         }
@@ -409,19 +416,36 @@ export async function getImageBlob(id: string): Promise<Blob | null> {
 // Object URL 缓存：同一个 id 只创建一次 URL，组件卸载时显式释放
 // ---------------------------------------------------------------
 const urlCache = new Map<string, string>()
+// 同一 id 的并发请求只创建一个 Object URL；否则并发 miss 会各建一个，先返回的那个永远泄漏
+// （React StrictMode 的 mount → cleanup → mount 会精确触发）
+const urlPending = new Map<string, Promise<string | null>>()
 
 /** 取图片的 Object URL（用于 <img src>）；不存在返回 null */
-export async function getImageUrl(id: string): Promise<string | null> {
+export function getImageUrl(id: string): Promise<string | null> {
   const cached = urlCache.get(id)
-  if (cached) return cached
-  const blob = await getImageBlob(id)
-  if (!blob) return null
-  const url = URL.createObjectURL(blob)
-  urlCache.set(id, url)
-  return url
+  if (cached) return Promise.resolve(cached)
+  const pending = urlPending.get(id)
+  if (pending) return pending
+
+  const p = (async () => {
+    const blob = await getImageBlob(id)
+    if (!blob) return null
+    // await 期间可能有别的路径写入缓存或释放，复查一次
+    const raced = urlCache.get(id)
+    if (raced) return raced
+    const url = URL.createObjectURL(blob)
+    urlCache.set(id, url)
+    return url
+  })().finally(() => urlPending.delete(id))
+
+  urlPending.set(id, p)
+  return p
 }
 
-/** 释放 Object URL（组件卸载时调用，避免内存泄漏） */
+/**
+ * 释放 Object URL（组件卸载时调用，避免内存泄漏）。
+ * 注意：同一 imageId 只允许一个活跃消费者；两个组件同时展示同一图片时会互相 revoke。
+ */
 export function releaseImageUrl(id: string): void {
   const url = urlCache.get(id)
   if (!url) return
@@ -433,12 +457,12 @@ export function releaseImageUrl(id: string): void {
 export async function deleteImages(ids: string[]): Promise<void> {
   if (!ids.length) return
   await withStore('readwrite', (s) => {
-    for (const id of ids) {
-      s.delete(id)
-      releaseImageUrl(id)
-    }
+    for (const id of ids) s.delete(id)
+    // 保留一个请求以满足 withStore 的签名；count 结果无消费者，仅用于维持事务句柄
     return s.count() as IDBRequest<number>
   })
+  // 事务提交后再释放缓存：删除失败回滚时不能提前清掉缓存
+  for (const id of ids) releaseImageUrl(id)
 }
 
 /** 统计图片张数与总字节数 */
@@ -591,34 +615,48 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
 
 把 `remove` 改为联动删图：
 
-```ts
-  const remove = useCallback((id: string) => {
-    setRecords((prev) => {
-      const target = prev.find((r) => r.id === id)
-      if (target?.imageId) void deleteImages([target.imageId])
-      return prev.filter((r) => r.id !== id)
-    })
-  }, [])
+> **修订（Task 3 质量审查后）**：原计划把 `deleteImages` 写在 `setRecords(prev => …)` 的 updater
+> **内部**，那是「在 updater 里做副作用」—— React StrictMode 会把 updater 跑两次，
+> 而且 `void deleteImages(...)` 没有 `.catch()`，失败会产生 unhandled rejection。
+> 改为：副作用放在 updater **外面**，用当前 `records` 取值，并加 `.catch()`。
 
-  const removeMany = useCallback((ids: string[]) => {
-    const set = new Set(ids)
-    setRecords((prev) => {
-      const removed = prev.filter((r) => set.has(r.id))
-      void deleteImages(collectImageIds(removed))
-      return prev.filter((r) => !set.has(r.id))
-    })
-  }, [])
+```ts
+  const remove = useCallback(
+    (id: string) => {
+      const target = records.find((r) => r.id === id)
+      setRecords((prev) => prev.filter((r) => r.id !== id))
+      if (target?.imageId) {
+        void deleteImages([target.imageId]).catch((e) =>
+          console.warn('[image] 删除图片失败:', e),
+        )
+      }
+    },
+    [records],
+  )
+
+  const removeMany = useCallback(
+    (ids: string[]) => {
+      const set = new Set(ids)
+      const imageIds = collectImageIds(records.filter((r) => set.has(r.id)))
+      setRecords((prev) => prev.filter((r) => !set.has(r.id)))
+      if (imageIds.length) {
+        void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
+      }
+    },
+    [records],
+  )
 ```
 
 把 `clear` 改为联动删图：
 
 ```ts
   const clear = useCallback(() => {
-    setRecords((prev) => {
-      void deleteImages(collectImageIds(prev))
-      return []
-    })
-  }, [])
+    const imageIds = collectImageIds(records)
+    setRecords([])
+    if (imageIds.length) {
+      void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
+    }
+  }, [records])
 ```
 
 新增 `addMany`（一次 setState 批量登记，返回新 id）：
