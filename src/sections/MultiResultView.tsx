@@ -45,42 +45,65 @@ export default function MultiResultView({ image, onRetake }: Props) {
   // 通过 Vite proxy 自动代理到本机 OCR 服务；放在组件内而非模块级，
   // 避免模块被导入到非浏览器环境时直接访问 window 报错
   const OCR_SERVER_URL = window.location.origin
-  const lastUrlRef = useRef<string | null>(null)
+  // 「本组件还活着吗」用 ref，不要用每次 effect 运行各建一个的局部布尔量。
+  //
+  // 局部 `let alive` 在 StrictMode 下会丢结果：run#1 起异步 → cleanup#1 把 alive₁
+  // 置 false → run#2 命中「同一张图」守卫直接 return（**不新建** alive₂）→
+  // run#1 完成时 `if (alive₁)` 为假，结果被丢弃，而 run#2 什么也没做。
+  // 界面就永远停在「准备识别…」转圈上。
+  // 实测（React 19 dev + StrictMode）：第一张照片永远转圈，换第二张才正常 ——
+  // 而 src/main.tsx 正是包着 <StrictMode> 的，所以 `pnpm dev` 下必现。
+  const aliveRef = useRef(true)
+  // 在飞的识别按 dataUrl 去重：StrictMode 的第二次运行拿回**同一个 Promise**，
+  // 于是它自己的 aliveRef 判定有效、结果照常落地，同时 OCR 只跑一遍。
+  const inflightRef = useRef<{ url: string; promise: Promise<MultiRecognizeResult> } | null>(null)
 
   useEffect(() => {
-    // 同一张图已识别过就跳过：StrictMode 会把 effect 跑两遍，而 OCR 很贵。
-    // 必须记住「已处理的 dataUrl」而不是用布尔锁 —— 布尔锁会让同一组件实例
-    // 换一张照片（dataUrl 变化）时也不重新识别，永远显示上一张的结果。
-    if (lastUrlRef.current === image.dataUrl) return
-    lastUrlRef.current = image.dataUrl
+    aliveRef.current = true
+    const url = image.dataUrl
 
-    let alive = true
-    const img = new Image()
-    img.onload = async () => {
-      try {
-        // 画布构造与绘制也放进 try。
-        // 放在外面的话，drawImage 一旦抛错（例如图片被判定为跨域污染），
-        // 异常会从 async 的 onload 里逃出去变成一个没人处理的 promise rejection，
-        // 而 setFailed 永远不会被调用 —— 界面就永远停在「准备识别…」的转圈上。
-        // 那正是本项目最忌讳的「静默失败」。
-        const canvas = document.createElement('canvas')
-        canvas.width = img.width
-        canvas.height = img.height
-        canvas.getContext('2d')!.drawImage(img, 0, 0)
-        const r = await recognizeMulti(canvas, OCR_SERVER_URL, (s) => {
-          if (alive) setStage(s)
-        })
-        if (alive) setResult(r)
-      } catch (e) {
-        if (alive) setFailed(String(e))
-      }
+    const start = (): Promise<MultiRecognizeResult> => {
+      const cached = inflightRef.current
+      if (cached && cached.url === url) return cached.promise
+      const promise = new Promise<MultiRecognizeResult>((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => {
+          try {
+            // 画布构造与绘制也放进 try。
+            // 放在外面的话，drawImage 一旦抛错（例如图片被判定为跨域污染），
+            // 异常会从 onload 里逃出去变成一个没人处理的 rejection，
+            // 而 setFailed 永远不会被调用 —— 界面就永远停在「准备识别…」的转圈上。
+            // 那正是本项目最忌讳的「静默失败」。
+            const canvas = document.createElement('canvas')
+            canvas.width = img.width
+            canvas.height = img.height
+            canvas.getContext('2d')!.drawImage(img, 0, 0)
+            resolve(
+              recognizeMulti(canvas, OCR_SERVER_URL, (s) => {
+                if (aliveRef.current) setStage(s)
+              }),
+            )
+          } catch (e) {
+            reject(e instanceof Error ? e : new Error(String(e)))
+          }
+        }
+        img.onerror = () => reject(new Error('图片无法解析'))
+        img.src = url
+      })
+      inflightRef.current = { url, promise }
+      return promise
     }
-    img.onerror = () => {
-      if (alive) setFailed('图片无法解析')
-    }
-    img.src = image.dataUrl
+
+    start()
+      .then((r) => {
+        if (aliveRef.current) setResult(r)
+      })
+      .catch((e) => {
+        if (aliveRef.current) setFailed(e instanceof Error ? e.message : String(e))
+      })
+
     return () => {
-      alive = false
+      aliveRef.current = false
     }
   }, [image.dataUrl, OCR_SERVER_URL])
 
@@ -90,7 +113,7 @@ export default function MultiResultView({ image, onRetake }: Props) {
     <div className="flex h-[100dvh] flex-col bg-black text-white">
       <header className="flex items-center justify-between px-5 pt-[max(env(safe-area-inset-top),16px)] pb-3">
         <div className="font-mono text-[11px] tracking-[0.25em] text-[#84898e] uppercase">
-          批量识别&nbsp;/&nbsp;{result ? `${devices.length} 台` : '识别中'}
+          批量识别&nbsp;/&nbsp;{failed ? '识别失败' : result ? `${devices.length} 台` : '识别中'}
         </div>
         <button
           onClick={onRetake}
@@ -102,8 +125,8 @@ export default function MultiResultView({ image, onRetake }: Props) {
 
       {/* 原图 + 标注层 */}
       <div className="relative mx-4 border border-[#1f1f1f] bg-[#0a0a0a]">
-        <div className="relative">
-          <img src={image.dataUrl} alt="拍摄照片" className="block w-full" />
+        <div className="relative mx-auto w-fit">
+          <img src={image.dataUrl} alt="拍摄照片" className="block max-h-[40dvh] max-w-full" />
           {/* 标注层：归一化坐标直接换算成百分比，无需知道显示尺寸 */}
           {devices.map((d, i) => {
             // 角标锚点：SN 框优先，退到第一个条码框，**都没有就不画**。
@@ -130,10 +153,17 @@ export default function MultiResultView({ image, onRetake }: Props) {
                     style={boxStyle(b)}
                   />
                 ))}
-                {/* 序号角标 */}
+                {/* 序号角标：画在框内左上角，**不要**向上翻转（`-translate-y-full`）。
+                    翻转后角标占的是 y0 正上方那一条，而 SN 标签贴顶（y0≈0）很常见，
+                    角标会翻到原图容器之外压住页头那行「批量识别 / N 台」。
+                    想用「y0 小于某个阈值才翻转」来兜也不成立：阈值是归一化量，
+                    放不放得下取决于图片的**渲染像素高度**，而它随宽高比变化
+                    （3:1 全景图只有 ~125px 高，9:16 竖图有 ~340px），一个常数盖不住。
+                    画在框内是确定的，代价是盖住 SN 文字开头一两个字符 —— 可以接受，
+                    因为 SN 就在下面的候选行里逐字显示。 */}
                 {badgeAnchor && (
                   <span
-                    className="absolute -translate-y-full bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black"
+                    className="absolute bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black"
                     style={badgeStyle(badgeAnchor)}
                   >
                     {i + 1}
