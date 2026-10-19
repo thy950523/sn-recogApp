@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   clearAll,
   deleteImages,
@@ -86,5 +86,38 @@ describe('imageStore', () => {
 
   it('getImageUrl 对不存在的 id 返回 null', async () => {
     expect(await getImageUrl('nope')).toBeNull()
+  })
+
+  it('同一 id 的并发请求复用同一个 Object URL', async () => {
+    const id = await putImage(jpeg(), 1, 1)
+    const [a, b] = await Promise.all([getImageUrl(id), getImageUrl(id)])
+    expect(a).toMatch(/^blob:/)
+    expect(b).toBe(a)
+    releaseImageUrl(id)
+  })
+
+  it('deleteImages 会 revoke 已缓存的 Object URL，之后取不到图', async () => {
+    const revoke = vi.spyOn(URL, 'revokeObjectURL')
+    const id = await putImage(jpeg(), 1, 1)
+    const url = await getImageUrl(id)
+    expect(url).toMatch(/^blob:/)
+    await deleteImages([id])
+    expect(revoke).toHaveBeenCalledWith(url)
+    expect(await getImageUrl(id)).toBeNull()
+    revoke.mockRestore()
+  })
+
+  it('clearAll 会 revoke 全部已缓存 URL', async () => {
+    const revoke = vi.spyOn(URL, 'revokeObjectURL')
+    const a = await putImage(jpeg(), 1, 1)
+    const b = await putImage(jpeg(), 1, 1)
+    const ua = await getImageUrl(a)
+    const ub = await getImageUrl(b)
+    await clearAll()
+    expect(revoke).toHaveBeenCalledWith(ua)
+    expect(revoke).toHaveBeenCalledWith(ub)
+    expect(await getImageUrl(a)).toBeNull()
+    expect(await getImageUrl(b)).toBeNull()
+    revoke.mockRestore()
   })
 })

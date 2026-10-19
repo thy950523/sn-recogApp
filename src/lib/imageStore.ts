@@ -79,6 +79,13 @@ function withStore<T>(
           // fn 可能同步抛错（如 put 非可克隆值时的 DataCloneError）
           req = fn(tx.objectStore(STORE))
         } catch (err) {
+          // 同步抛错时事务里可能已排入部分写操作，必须 abort 回滚，
+          // 否则调用方收到 reject、数据却已部分生效
+          try {
+            tx.abort()
+          } catch {
+            /* 事务可能已结束 */
+          }
           fail(err)
           return
         }
@@ -120,19 +127,35 @@ export async function getImageBlob(id: string): Promise<Blob | null> {
 // Object URL 缓存：同一个 id 只创建一次 URL，组件卸载时显式释放
 // ---------------------------------------------------------------
 const urlCache = new Map<string, string>()
+// 同一 id 的并发请求只创建一个 Object URL；否则并发 miss 会各建一个，先返回的那个永远泄漏
+const urlPending = new Map<string, Promise<string | null>>()
 
 /** 取图片的 Object URL（用于 <img src>）；不存在返回 null */
-export async function getImageUrl(id: string): Promise<string | null> {
+export function getImageUrl(id: string): Promise<string | null> {
   const cached = urlCache.get(id)
-  if (cached) return cached
-  const blob = await getImageBlob(id)
-  if (!blob) return null
-  const url = URL.createObjectURL(blob)
-  urlCache.set(id, url)
-  return url
+  if (cached) return Promise.resolve(cached)
+  const pending = urlPending.get(id)
+  if (pending) return pending
+
+  const p = (async () => {
+    const blob = await getImageBlob(id)
+    if (!blob) return null
+    // await 期间可能有别的路径写入缓存或释放，复查一次
+    const raced = urlCache.get(id)
+    if (raced) return raced
+    const url = URL.createObjectURL(blob)
+    urlCache.set(id, url)
+    return url
+  })().finally(() => urlPending.delete(id))
+
+  urlPending.set(id, p)
+  return p
 }
 
-/** 释放 Object URL（组件卸载时调用，避免内存泄漏） */
+/**
+ * 释放 Object URL（组件卸载时调用，避免内存泄漏）。
+ * 同一 imageId 只允许一个活跃消费者；多组件同时展示同一图片时会互相 revoke。
+ */
 export function releaseImageUrl(id: string): void {
   const url = urlCache.get(id)
   if (!url) return
@@ -144,12 +167,12 @@ export function releaseImageUrl(id: string): void {
 export async function deleteImages(ids: string[]): Promise<void> {
   if (!ids.length) return
   await withStore('readwrite', (s) => {
-    for (const id of ids) {
-      s.delete(id)
-      releaseImageUrl(id)
-    }
+    for (const id of ids) s.delete(id)
+    // 保留一个请求以满足 withStore 的签名；count 结果无消费者，仅用于维持事务句柄
     return s.count() as IDBRequest<number>
   })
+  // 事务提交后再释放缓存：删除失败回滚时不能提前清掉缓存
+  for (const id of ids) releaseImageUrl(id)
 }
 
 /**
@@ -185,7 +208,8 @@ export async function saveCanvasImage(
   const out = document.createElement('canvas')
   out.width = width
   out.height = height
-  const ctx = out.getContext('2d')!
+  const ctx = out.getContext('2d')
+  if (!ctx) throw new Error('无法创建画布上下文')
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
   ctx.drawImage(canvas, 0, 0, width, height)
