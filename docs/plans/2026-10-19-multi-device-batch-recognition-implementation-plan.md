@@ -20,6 +20,12 @@
 - 类型导入用 `import type`（`verbatimModuleSyntax` 已开启）。
 - 测试文件与源文件同目录：`src/lib/xxx.test.ts`。
 - 每个 Task 结束都要 commit。
+- **类型检查一律用 `npx tsc -b`**（或 `npx tsc -p tsconfig.app.json --noEmit`），
+  **不要用裸 `npx tsc --noEmit`** —— 根 `tsconfig.json` 是 `"files": []` + project
+  references，而 `--noEmit` 不构建 references，于是它**一个源文件都不检查、直接 exit 0**。
+  实测：`--listFiles` 数出的 src 文件数是 **0**；在源码里植入 `const x: number = "a"`
+  后，裸 `tsc --noEmit` 仍然 exit 0，而 `-p tsconfig.app.json` 报 TS2322。
+  这个门禁不会变红，等于没有门禁（本项目最忌的静默失败）。
 - **包管理器用 pnpm**（`node_modules` 是 pnpm 布局，npm 会破坏它）。`pnpm-lock.yaml` 与
   `package-lock.json` 历史上都被跟踪，属既有混乱，本次只更新 `pnpm-lock.yaml`。
 
