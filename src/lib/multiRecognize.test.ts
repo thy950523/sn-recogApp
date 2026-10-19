@@ -228,6 +228,25 @@ describe('buildCandidates', () => {
     expect(d.imei2).toBe('356938035643999')
   })
 
+  it('机身最常见的「IMEI: + IMEI2:」（都不带槽位标签）时，补槽位让两条各落到正确字段', () => {
+    // 这是机身最常见的排版：第一行只印「IMEI:」不带槽位数字（slot 为 null），
+    // 第二行印「IMEI2:」。补槽位逻辑真正服务的就是这种排版 —— 未标槽位的那条被补进
+    // 空闲的槽位 1，消费侧按槽位取值才能拿到它。若去掉补槽位，imeis 只剩
+    // [slot=2, slot=null]，imeiBySlot(imeis, 1) 返回 null —— 这条 IMEI 整个丢掉。
+    //
+    // 变异验证：删掉 deviceFields.ts 里 `if (f.slot !== null) return f` 那段补槽位映射后，
+    // 本用例变红（d.imei 为 null）。补槽位是承重逻辑，这条用例专门钉住「补槽位 ↔ 消费侧
+    // 按槽位取值」这个接缝，避免它只在 deviceFields 单测层面被覆盖、消费侧悄悄回归。
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.10, 0.14),
+      line('IMEI 356938035643809', 0.15, 0.19),
+      line('IMEI2 356938035643999', 0.20, 0.24),
+    ]
+    const [d] = buildCandidates(lines, [])
+    expect(d.imei).toBe('356938035643809')
+    expect(d.imei2).toBe('356938035643999')
+  })
+
   it('同一 S/N 重复出现时只保留一条', () => {
     const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14), line('S/N: 8A7C2D1E', 0.30, 0.34)]
     expect(buildCandidates(lines, [])).toHaveLength(1)
