@@ -206,6 +206,10 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
    */
   const isDuplicate = (sn: string, i: number) => {
     const n = normalizeSn(sn)
+    // 归一化后为空的行不参与判重。用户把两行都清空（或只留标点）时它们会互相「相同」，
+    // 于是两行各挂一个 ⛔ 重复 —— 但空行本就不参与登记（过滤与 checkedCount 都用
+    // `normalizeSn(r.sn) !== ''`），标它重复是在说一件不存在的事。
+    if (!n) return false
     return (
       existingSns.some((s) => normalizeSn(s) === n) ||
       rows.some((r, j) => j !== i && normalizeSn(r.sn) === n)
