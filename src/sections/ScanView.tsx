@@ -100,8 +100,22 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
               streamRef.current = null
               setCameraError('无法启动相机实时预览，可能被其他应用占用或浏览器禁止自动播放。')
               // 直接退出重试循环：play() 失败通常是自动播放策略问题，重试一次不会变好。
+              // 这里不区分 AbortError（被新的 load 请求打断，属瞬时）与 NotAllowedError
+              // （自动播放策略，持久）：本路径 srcObject 只赋值一次、不会产生 AbortError，
+              // 所以「一律不重试」是有意的判断，不是漏了。
               return
             }
+          } else {
+            // 防御性补齐：当前代码下不可达（<video> 无条件渲染、effect 在 commit 后运行），
+            // 但若真发生，绝不能静默 —— 跳过 srcObject 与 play() 后会直接落到下面的
+            // `setCameraError(null); return`，结果是 streamRef 留着**活着的 stream**
+            // （摄像头亮着）、没有预览、没有任何错误提示，底部按钮仍是 handleShutter，
+            // 界面看起来一切正常。与上面的 play() 失败同一套处理：停掉 track、清空
+            // streamRef、设 cameraError（浮层说明原因并把按钮切到系统相机，用户有路可走）。
+            stream.getTracks().forEach((t) => t.stop())
+            streamRef.current = null
+            setCameraError('相机预览组件未就绪，无法显示实时画面，请改用下方按钮拍照或从相册导入。')
+            return
           }
           setCameraError(null)
           return
@@ -139,7 +153,13 @@ export default function ScanView({ count, onShot, onOpenRecords, setScreen }: Pr
   /** 一键拍照：直接抓实时画面的当前帧 */
   const handleShutter = useCallback(() => {
     const video = videoRef.current
-    if (!video) return
+    if (!video) {
+      // 防御性补齐：当前代码下不可达（<video> 无条件渲染、effect 在 commit 后运行），
+      // 但静默返回会让用户点了按钮却毫无反应。与下面 captureFrame 返回 null 时同一套
+      // 可见反馈（setLoadError），不吞错。
+      setLoadError('取景组件尚未就绪，请稍候重试。')
+      return
+    }
     const img = encodePayload(video, video.videoWidth, video.videoHeight)
     if (!img) {
       // 取景尚未就绪（如 autoplay 失败导致画面为黑）时不能静默：给用户可见反馈
