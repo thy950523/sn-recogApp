@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import {
-  recognizeMulti,
-  type DeviceCandidate,
-  type MultiRecognizeResult,
-} from '@/lib/multiRecognize'
+import { recognizeMulti, type MultiRecognizeResult } from '@/lib/multiRecognize'
+import { normalizeSn } from '@/lib/deviceFields'
+import { rowsToRecords, type CandidateRow } from '@/lib/registerRows'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
 
@@ -140,7 +138,7 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
   }, [image.dataUrl, OCR_SERVER_URL])
 
   /** 每行的勾选状态与可编辑 SN；result 到位时初始化 */
-  const [rows, setRows] = useState<{ sn: string; checked: boolean; source: DeviceCandidate }[]>([])
+  const [rows, setRows] = useState<CandidateRow[]>([])
 
   // existingSns 每次父组件渲染都可能是新数组。若直接放进初始化 effect 的依赖，
   // 父组件任何一次重渲染都会把用户的勾选、编辑、删行全部重置。
@@ -160,7 +158,9 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
     if (!result) return
     setRows(
       result.devices.map((d) => {
-        const dup = existingRef.current.includes(d.sn)
+        // 与 isDuplicate 用同一套归一化比较，否则会出现「红标说重复、勾选框却默认勾上」
+        // 的自相矛盾：d.sn 侧本来就是纯字母数字，要归一化的是记录侧那个自由文本。
+        const dup = existingRef.current.some((s) => normalizeSn(s) === d.sn)
         return {
           sn: d.sn,
           // 默认勾选；与已有记录重复的默认不勾，避免误登记
@@ -171,7 +171,9 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
     )
   }, [result])
 
-  const checkedCount = rows.filter((r) => r.checked && r.sn.trim()).length
+  // 判据必须与 rowsToRecords 的过滤一致（都是「勾选且归一化后非空」），
+  // 否则按钮说「登记 N 条」、实际却存了 M 条，是静默不一致。
+  const checkedCount = rows.filter((r) => r.checked && normalizeSn(r.sn) !== '').length
 
   const toggle = (i: number) =>
     setRows((prev) => prev.map((r, j) => (j === i ? { ...r, checked: !r.checked } : r)))
@@ -179,33 +181,39 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
   const editSn = (i: number, sn: string) =>
     setRows((prev) => prev.map((r, j) => (j === i ? { ...r, sn: sn.toUpperCase() } : r)))
 
-  const drop = (i: number) => setRows((prev) => prev.filter((_, j) => j !== i))
+  // 删行后行整体上移，而列表 key 与 activeIndex 都是下标：若不清掉选中态，
+  // 高亮会落到「原本的下一行」——那是另一台设备的行与标注框。
+  // 直接清空选中即可，不必为此引入稳定 id 那套更大的重构。
+  const drop = (i: number) => {
+    setActiveIndex(null)
+    setRows((prev) => prev.filter((_, j) => j !== i))
+  }
 
-  /** 重复行：与已有记录或其他候选行 SN 相同 */
-  const isDuplicate = (sn: string, i: number) =>
-    existingSns.includes(sn) || rows.some((r, j) => j !== i && r.sn === sn)
+  /**
+   * 重复行：与已有记录或其他候选行 SN 相同。
+   *
+   * **必须按归一化后的值比较**：OCR 侧 DeviceCandidate.sn 永远是纯字母数字
+   * （snFromLine 走 extractSnByMarker 的 [A-Z0-9]{6,20} 或 extractSnCandidates
+   * 的 [^A-Z0-9]+ 切词；条码分支的 b.value 也经 toHit→normalizeSn），
+   * 而记录侧 SnRecord.sn 是**用户可编辑的自由文本**（editSn 只做 toUpperCase、
+   * 不剥分隔符），store.addMany 也只是 {...r} 原样存。
+   * 于是用户把某条改成 "AB-12-34" 登记后，再拍同一台设备（OCR 出 "AB1234"），
+   * 用原始值 includes('AB1234') 会漏判 —— 该行既不显示 ⛔ 重复、又被默认勾选，
+   * 用户一按登记就把重复设备存了，全程无提示（本项目最忌的静默出错）。
+   *
+   * 两处判据必须一起改：这里（红标）与初始化 effect 的默认勾选闸门。
+   * 只改一处就会出现「红标说重复、勾选框却默认勾上」的自相矛盾。
+   */
+  const isDuplicate = (sn: string, i: number) => {
+    const n = normalizeSn(sn)
+    return (
+      existingSns.some((s) => normalizeSn(s) === n) ||
+      rows.some((r, j) => j !== i && normalizeSn(r.sn) === n)
+    )
+  }
 
   const register = () => {
-    const list: Omit<SnRecord, 'id' | 'time'>[] = rows
-      .filter((r) => r.checked && r.sn.trim())
-      .map((r) => ({
-        sn: r.sn,
-        source: r.source.barcode === r.sn ? 'barcode' : 'manual',
-        verified: r.source.status === 'match' && r.source.barcode === r.sn,
-        barcode: r.source.barcode,
-        barcodes: r.source.barcodes,
-        // pending 的 SN 同样是 OCR 读出来的（只是缺坐标），不能从 ocr 字段里丢掉
-        ocr:
-          r.source.status === 'match' || r.source.status === 'ocr_only' || r.source.status === 'pending'
-            ? r.source.sn
-            : null,
-        imei: r.source.imei,
-        imei2: r.source.imei2,
-        meid: r.source.meid,
-        eid: r.source.eid,
-        rawOcr: r.source.rawOcr || null,
-        imageId: imageId ?? undefined,
-      }))
+    const list = rowsToRecords(rows, imageId)
     if (list.length) onRegister(list)
   }
 
@@ -332,6 +340,7 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
                   checked={row.checked}
                   onChange={() => toggle(i)}
                   onClick={(e) => e.stopPropagation()}
+                  aria-label={`选择第 ${i + 1} 台设备`}
                   className="h-5 w-5 shrink-0 accent-[#ffc700]"
                 />
                 <span className="w-6 shrink-0 font-mono text-[11px] text-[#555]">{i + 1}</span>
@@ -349,6 +358,7 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
                     e.stopPropagation()
                     drop(i)
                   }}
+                  aria-label={`删除第 ${i + 1} 台`}
                   className="shrink-0 border border-[#2a2a2a] px-2 py-1 font-mono text-xs text-[#84898e] active:bg-[#161616]"
                 >
                   ✕
@@ -378,9 +388,13 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
           )
         })}
 
+        {/* rows 为空有两种来路：识别确实没结果，或用户自己把候选行删光了。
+            对后者说「未识别到，请重拍」是误导 —— 数据是用户删的，不是没拍到。 */}
         {result && rows.length === 0 && (
           <p className="border border-[#1a1a1a] px-4 py-3 font-mono text-sm text-[#555]">
-            未识别到任何设备，请重拍或调整角度
+            {result.devices.length === 0
+              ? '未识别到任何设备，请重拍或调整角度'
+              : '候选行已全部删除，如需登记请重拍'}
           </p>
         )}
       </div>
