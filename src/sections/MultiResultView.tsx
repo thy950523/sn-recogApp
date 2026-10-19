@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { recognizeMulti, type MultiRecognizeResult } from '@/lib/multiRecognize'
-import { normalizeSn } from '@/lib/deviceFields'
-import { rowsToRecords, hasSn, isDuplicateSn, type CandidateRow } from '@/lib/registerRows'
+import { rowsToRecords, hasSn, isDuplicateSn, barcodeDiffers, type CandidateRow } from '@/lib/registerRows'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
 
@@ -165,8 +164,13 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
         const dup = isDuplicateSn(d.sn, existingRef.current)
         return {
           sn: d.sn,
-          // 默认勾选；与已有记录重复的默认不勾，避免误登记
-          checked: !!d.sn && !dup,
+          // 默认勾选；与已有记录重复的默认不勾，避免误登记。
+          //
+          // 判据必须走 hasSn，不能退回 `!!d.sn`：勾选闸门与 checkedCount、
+          // rowsToRecords 的过滤必须同判据。当前 d.sn 恒为纯字母数字，两者等价；
+          // 但将来某条候选产出路径给出 "---"（归一化后为空）时，`!!d.sn` 会勾上
+          // 一行、按钮计数却不含它 —— 界面自相矛盾。
+          checked: hasSn(d.sn) && !dup,
           source: d,
         }
       }),
@@ -365,12 +369,11 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
                     ⛔ 重复
                   </span>
                 )}
-                {/* 必须按归一化值比较：d.barcode 是归一化值（条码经 recognize.ts 的
-                    toHit→normalizeSn），而 row.sn 是用户可编辑的自由文本。用原始值比
-                    时，用户把 SN 改成 "AB-12-34" 会显示一条本不存在的「条码 AB1234」提示，
-                    可这条记录实际会以 source='barcode'、verified=true 入库（见 rowsToRecords）
-                    —— 界面与落库结果自相矛盾。理由与 isDuplicateSn 完全相同。 */}
-                {d.barcode && d.barcode !== normalizeSn(row.sn) && (
+                {/* 判据本体（为什么必须按归一化值比较、用原始值比会显示一条
+                    本不存在的「条码 X」而记录其实会以 source='barcode'、
+                    verified=true 入库）在 registerRows.barcodeDiffers，
+                    那里是纯函数、有测试覆盖。这里只负责把值传进去。 */}
+                {barcodeDiffers(d.barcode, row.sn) && (
                   <span className="font-mono text-[10px] text-[#777]">条码 {d.barcode}</span>
                 )}
                 {d.imei && <span className="font-mono text-[10px] text-[#777]">IMEI {d.imei}</span>}

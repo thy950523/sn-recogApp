@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { rowsToRecords, hasSn, isDuplicateSn, type CandidateRow } from './registerRows'
+import { rowsToRecords, hasSn, isDuplicateSn, barcodeDiffers, type CandidateRow } from './registerRows'
 import type { DeviceCandidate } from './multiRecognize'
 
 /** 造一个字段齐全的 DeviceCandidate fixture，默认值取「无条码、仅 OCR」 */
@@ -67,6 +67,30 @@ describe('isDuplicateSn', () => {
 
   it('sn 归一化后为空（---）且 others 里也有一项归一化后为空 → 仍返回 false', () => {
     expect(isDuplicateSn('---', ['---'])).toBe(false)
+  })
+})
+
+describe('barcodeDiffers', () => {
+  it('条码与 SN 完全一致（AB1234 / AB1234）→ false，不提示', () => {
+    expect(barcodeDiffers('AB1234', 'AB1234')).toBe(false)
+  })
+
+  it('条码与「手改后带分隔符」的 SN 归一化后一致（AB1234 / ab-12-34）→ false，不提示', () => {
+    // 这条正是那个 bug：用原始 sn 比会提示一条本不存在的「条码 AB1234」，
+    // 而记录实际会以 source='barcode'、verified=true 入库。
+    expect(barcodeDiffers('AB1234', 'ab-12-34')).toBe(false)
+  })
+
+  it('条码与 SN 确实不同（AB1234 / CD5678）→ true，提示', () => {
+    expect(barcodeDiffers('AB1234', 'CD5678')).toBe(true)
+  })
+
+  it('条码为 null → false，不提示', () => {
+    expect(barcodeDiffers(null, 'AB1234')).toBe(false)
+  })
+
+  it('条码为空串 → false，不提示', () => {
+    expect(barcodeDiffers('', 'AB1234')).toBe(false)
   })
 })
 

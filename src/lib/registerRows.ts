@@ -45,10 +45,23 @@ export const hasSn = (sn: string): boolean => normalizeSn(sn) !== ''
  * 两行都清空时它们会互相「相同」，各挂一个 ⛔ 重复 —— 那是在说一件不存在的事。
  */
 export function isDuplicateSn(sn: string, others: readonly string[]): boolean {
+  // 走 hasSn 而不是自己再判一次：判重与过滤/计数必须共用同一判据，
+  // 否则「改了 hasSn 却没带动判重」这类漂移没人会发现。
+  if (!hasSn(sn)) return false
   const n = normalizeSn(sn)
-  if (!n) return false
   return others.some((s) => normalizeSn(s) === n)
 }
+
+/**
+ * 是否需要在候选行上提示「条码 X」。
+ *
+ * 只在条码与（归一化后的）SN 确实不同时才提示。用原始 `sn` 比会出错：
+ * 用户把 SN 改成 `AB-12-34` 而条码是 `AB1234` 时，界面会提示一条本不存在的
+ * 「条码 AB1234」，可这条记录实际会以 source='barcode'、verified=true 入库 ——
+ * 界面与落库结果自相矛盾。
+ */
+export const barcodeDiffers = (barcode: string | null, sn: string): boolean =>
+  !!barcode && barcode !== normalizeSn(sn)
 
 /**
  * 只取勾选且归一化后非空的行。返回的顺序与传入一致。
