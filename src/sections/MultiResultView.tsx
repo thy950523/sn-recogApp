@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { recognizeMulti, type MultiRecognizeResult } from '@/lib/multiRecognize'
+import {
+  recognizeMulti,
+  type DeviceCandidate,
+  type MultiRecognizeResult,
+} from '@/lib/multiRecognize'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
 
@@ -36,12 +40,12 @@ function badgeStyle(box: Box4): CSSProperties {
   return { left: `${box[0] * 100}%`, top: `${box[1] * 100}%` }
 }
 
-export default function MultiResultView({ image, onRetake }: Props) {
+export default function MultiResultView({ image, existingSns, onRetake, onRegister, imageId }: Props) {
   const [stage, setStage] = useState('准备识别…')
   const [result, setResult] = useState<MultiRecognizeResult | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
   /** 当前高亮的候选下标（点列表行时联动高亮框） */
-  const [activeIndex] = useState<number | null>(null)
+  const [activeIndex, setActiveIndex] = useState<number | null>(null)
   // 通过 Vite proxy 自动代理到本机 OCR 服务；放在组件内而非模块级，
   // 避免模块被导入到非浏览器环境时直接访问 window 报错
   const OCR_SERVER_URL = window.location.origin
@@ -135,13 +139,81 @@ export default function MultiResultView({ image, onRetake }: Props) {
     }
   }, [image.dataUrl, OCR_SERVER_URL])
 
-  const devices = result?.devices ?? []
+  /** 每行的勾选状态与可编辑 SN；result 到位时初始化 */
+  const [rows, setRows] = useState<{ sn: string; checked: boolean; source: DeviceCandidate }[]>([])
+
+  // existingSns 每次父组件渲染都可能是新数组。若直接放进初始化 effect 的依赖，
+  // 父组件任何一次重渲染都会把用户的勾选、编辑、删行全部重置。
+  // 用 ref 取最新值，只在 result 变化时初始化一次。
+  //
+  // 赋值放在 effect 里，**不要**在渲染期直接写 `existingRef.current = existingSns`：
+  // 本项目 lint 启用了 react-hooks 的 refs 规则，渲染期写 ref 会报
+  // 「Cannot access refs during render」。本 effect 声明在初始化 effect 之前，
+  // 两者属于同一次 commit、按声明顺序执行，所以初始化读到的是**本次渲染**的
+  // existingSns，与渲染期赋值等价。
+  const existingRef = useRef(existingSns)
+  useEffect(() => {
+    existingRef.current = existingSns
+  })
+
+  useEffect(() => {
+    if (!result) return
+    setRows(
+      result.devices.map((d) => {
+        const dup = existingRef.current.includes(d.sn)
+        return {
+          sn: d.sn,
+          // 默认勾选；与已有记录重复的默认不勾，避免误登记
+          checked: !!d.sn && !dup,
+          source: d,
+        }
+      }),
+    )
+  }, [result])
+
+  const checkedCount = rows.filter((r) => r.checked && r.sn.trim()).length
+
+  const toggle = (i: number) =>
+    setRows((prev) => prev.map((r, j) => (j === i ? { ...r, checked: !r.checked } : r)))
+
+  const editSn = (i: number, sn: string) =>
+    setRows((prev) => prev.map((r, j) => (j === i ? { ...r, sn: sn.toUpperCase() } : r)))
+
+  const drop = (i: number) => setRows((prev) => prev.filter((_, j) => j !== i))
+
+  /** 重复行：与已有记录或其他候选行 SN 相同 */
+  const isDuplicate = (sn: string, i: number) =>
+    existingSns.includes(sn) || rows.some((r, j) => j !== i && r.sn === sn)
+
+  const register = () => {
+    const list: Omit<SnRecord, 'id' | 'time'>[] = rows
+      .filter((r) => r.checked && r.sn.trim())
+      .map((r) => ({
+        sn: r.sn,
+        source: r.source.barcode === r.sn ? 'barcode' : 'manual',
+        verified: r.source.status === 'match' && r.source.barcode === r.sn,
+        barcode: r.source.barcode,
+        barcodes: r.source.barcodes,
+        // pending 的 SN 同样是 OCR 读出来的（只是缺坐标），不能从 ocr 字段里丢掉
+        ocr:
+          r.source.status === 'match' || r.source.status === 'ocr_only' || r.source.status === 'pending'
+            ? r.source.sn
+            : null,
+        imei: r.source.imei,
+        imei2: r.source.imei2,
+        meid: r.source.meid,
+        eid: r.source.eid,
+        rawOcr: r.source.rawOcr || null,
+        imageId: imageId ?? undefined,
+      }))
+    if (list.length) onRegister(list)
+  }
 
   return (
     <div className="flex h-[100dvh] flex-col bg-black text-white">
       <header className="flex items-center justify-between px-5 pt-[max(env(safe-area-inset-top),16px)] pb-3">
         <div className="font-mono text-[11px] tracking-[0.25em] text-[#84898e] uppercase">
-          批量识别&nbsp;/&nbsp;{failed ? '识别失败' : result ? `${devices.length} 台` : '识别中'}
+          批量识别&nbsp;/&nbsp;{failed ? '识别失败' : result ? `${rows.length} 台` : '识别中'}
         </div>
         <button
           onClick={onRetake}
@@ -162,7 +234,8 @@ export default function MultiResultView({ image, onRetake }: Props) {
         <div className="relative mx-auto w-fit">
           <img src={image.dataUrl} alt="拍摄照片" className="block max-h-[40dvh] max-w-full" />
           {/* 标注层：归一化坐标直接换算成百分比，无需知道显示尺寸 */}
-          {devices.map((d, i) => {
+          {rows.map((row, i) => {
+            const d = row.source
             // 角标锚点：SN 框优先，退到第一个条码框，**都没有就不画**。
             // 不要用 `?? [0, 0, 0, 0]` 兜底 —— 那会在图片左上角戳出一个凭空的角标，
             // 而降级模式下 markUnverified 已把 snBox 与 barcodeBoxes 都清空
@@ -228,8 +301,99 @@ export default function MultiResultView({ image, onRetake }: Props) {
             ⚠ {result.error}
           </div>
         )}
-        {/* 候选列表在 Task 9 实现 */}
+        {rows.map((row, i) => {
+          const d = row.source
+          const dup = isDuplicate(row.sn, i)
+          // pending 是 Task 7 降级路径（OCR 无坐标）产出的状态，必须显式列出：
+          // 落到最后的兜底会显示成「⛔ 未识别」，那是在说「没识别到」，
+          // 而实际是「识别到了但配对未经校验」——两回事，会误导用户重拍。
+          const statusLabel =
+            d.status === 'match' ? '✓ 双验证一致'
+              : d.status === 'mismatch' ? '⚠ 与条码不一致'
+              : d.status === 'barcode_only' ? '⚠ 仅条码'
+              : d.status === 'ocr_only' ? '⚠ 仅 OCR'
+              : d.status === 'pending' ? '⚠ 待人工确认'
+              : '⛔ 未识别'
+          const statusClass =
+            d.status === 'match' ? 'border-[#35d07f]/60 text-[#35d07f]'
+              : d.status === 'mismatch' || d.status === 'none' ? 'border-[#f00007]/60 text-[#ff6b6b]'
+              : 'border-[#ffc700]/60 text-[#ffc700]'
+          return (
+            <div
+              key={i}
+              onClick={() => setActiveIndex(i)}
+              className={`mb-2 border px-3 py-2.5 ${
+                activeIndex === i ? 'border-[#ffc700] bg-[#ffc700]/5' : 'border-[#2a2a2a]'
+              }`}
+            >
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={row.checked}
+                  onChange={() => toggle(i)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="h-5 w-5 shrink-0 accent-[#ffc700]"
+                />
+                <span className="w-6 shrink-0 font-mono text-[11px] text-[#555]">{i + 1}</span>
+                <input
+                  value={row.sn}
+                  onChange={(e) => editSn(i, e.target.value)}
+                  onClick={(e) => e.stopPropagation()}
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  className="min-w-0 flex-1 border border-[#2a2a2a] bg-[#0a0a0a] px-2 py-1.5 font-mono text-base tracking-[0.1em] text-white uppercase outline-none focus:border-[#ffc700]"
+                />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    drop(i)
+                  }}
+                  className="shrink-0 border border-[#2a2a2a] px-2 py-1 font-mono text-xs text-[#84898e] active:bg-[#161616]"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2 pl-9">
+                <span className={`border px-1.5 py-0.5 font-mono text-[10px] ${statusClass}`}>
+                  {statusLabel}
+                </span>
+                {dup && (
+                  <span className="border border-[#f00007]/60 px-1.5 py-0.5 font-mono text-[10px] text-[#ff6b6b]">
+                    ⛔ 重复
+                  </span>
+                )}
+                {d.barcode && d.barcode !== row.sn && (
+                  <span className="font-mono text-[10px] text-[#777]">条码 {d.barcode}</span>
+                )}
+                {d.imei && <span className="font-mono text-[10px] text-[#777]">IMEI {d.imei}</span>}
+                {d.imei2 && <span className="font-mono text-[10px] text-[#777]">IMEI2 {d.imei2}</span>}
+                {d.eid && <span className="font-mono text-[10px] text-[#777]">EID {d.eid}</span>}
+                {d.meid && <span className="font-mono text-[10px] text-[#777]">MEID {d.meid}</span>}
+              </div>
+              {d.note && (
+                <p className="mt-1 pl-9 font-mono text-[10px] text-[#ffc700]">{d.note}</p>
+              )}
+            </div>
+          )
+        })}
+
+        {result && rows.length === 0 && (
+          <p className="border border-[#1a1a1a] px-4 py-3 font-mono text-sm text-[#555]">
+            未识别到任何设备，请重拍或调整角度
+          </p>
+        )}
       </div>
+
+      <footer className="border-t border-[#1a1a1a] px-4 pt-3 pb-[max(env(safe-area-inset-bottom),16px)]">
+        <button
+          onClick={register}
+          disabled={checkedCount === 0}
+          className="w-full bg-[#ffc700] py-4 font-mono text-base font-bold tracking-[0.25em] text-black uppercase active:bg-[#e0b000] disabled:bg-[#2a2a2a] disabled:text-[#666]"
+        >
+          登记选中的 {checkedCount} 条
+        </button>
+      </footer>
     </div>
   )
 }
