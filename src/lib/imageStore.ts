@@ -44,7 +44,12 @@ function openDb(): Promise<IDBDatabase> {
   })
 }
 
-/** 在一个事务里执行操作，事务完成后再 resolve */
+/**
+ * 在一个事务里执行操作。
+ * 请求的 onsuccess 只负责取回结果，**事务 oncomplete 才算成功** ——
+ * 配额错误等常在提交时才暴露，若在请求成功就 resolve，会把「没存进去」当成「存成功」。
+ * 事务被中止时 reject，避免调用方永久 await。
+ */
 function withStore<T>(
   mode: IDBTransactionMode,
   fn: (store: IDBObjectStore) => IDBRequest<T>,
@@ -52,11 +57,44 @@ function withStore<T>(
   return openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const tx = db.transaction(STORE, mode)
-        const req = fn(tx.objectStore(STORE))
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error ?? new Error('图片数据库操作失败'))
-        tx.oncomplete = () => db.close()
+        let result: T
+        let settled = false
+        const fail = (err: unknown) => {
+          if (settled) return
+          settled = true
+          db.close()
+          reject(err instanceof Error ? err : new Error(String(err)))
+        }
+
+        let tx: IDBTransaction
+        try {
+          tx = db.transaction(STORE, mode)
+        } catch (err) {
+          fail(err)
+          return
+        }
+
+        let req: IDBRequest<T>
+        try {
+          // fn 可能同步抛错（如 put 非可克隆值时的 DataCloneError）
+          req = fn(tx.objectStore(STORE))
+        } catch (err) {
+          fail(err)
+          return
+        }
+
+        req.onsuccess = () => {
+          result = req.result
+        }
+        req.onerror = () => fail(req.error ?? new Error('图片数据库操作失败'))
+        tx.oncomplete = () => {
+          if (settled) return
+          settled = true
+          db.close()
+          resolve(result)
+        }
+        tx.onabort = () => fail(tx.error ?? new Error('图片数据库事务被中止'))
+        tx.onerror = () => fail(tx.error ?? new Error('图片数据库事务失败'))
       }),
   )
 }
@@ -114,7 +152,12 @@ export async function deleteImages(ids: string[]): Promise<void> {
   })
 }
 
-/** 统计图片张数与总字节数 */
+/**
+ * 统计图片张数与总字节数。
+ * 这里用 getAll() 取全部记录：浏览器里 Blob 是磁盘引用（不是整块内存），
+ * 所以即便几百张图也不会把像素读进内存，开销可接受。
+ * 若哪天记录里塞进了大块非 Blob 数据，再改成游标累加。
+ */
 export async function estimateUsage(): Promise<{ count: number; bytes: number }> {
   const all = await withStore<StoredImage[]>('readonly', (s) => s.getAll())
   return {
