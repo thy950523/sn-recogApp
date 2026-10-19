@@ -2588,10 +2588,24 @@ git commit -m "feat(ui): 候选列表勾选/编辑/删除与批量登记"
    **只改一处会出现「红标说重复、勾选框却默认勾上」的自相矛盾。**
 
 2. **登记映射抽成了纯函数** `rowsToRecords(rows, imageId)`，见新建的
-   `src/lib/registerRows.ts` + `src/lib/registerRows.test.ts`（12 条用例，已做变异测试）。
+   `src/lib/registerRows.ts` + `src/lib/registerRows.test.ts`（30 条用例，已做变异测试）。
    组件里 `rows` 的类型是那里导出的 `CandidateRow`。
    理由：这段映射决定「什么被写进数据库」，其中几条规则不直观（`pending` 也算 OCR 值、
    `source`/`verified` 依赖条码比对），且曾经改错过一次。
+
+   同一个文件里还有三个供组件与映射共用的纯谓词，**判据只此一份**：
+   - `hasSn(sn)` = `normalizeSn(sn) !== ''` —— 过滤、`checkedCount`、初始化 `rows` 的
+     默认勾选闸门、判重四处共用。改它一处，三条测试跨三个函数一起红（已实测），
+     这正是收拢的目的：漂移会被测试发现。
+   - `isDuplicateSn(sn, others)` —— 判重（两侧归一化，空值不算重复）。内部走 `hasSn`，
+     所以它也在 `hasSn` 的爆炸半径内。
+   - `barcodeDiffers(barcode, sn)` —— 是否提示「条码 X」。**必须**用归一化后的 SN 比：
+     用原始 `sn` 的话，用户把 SN 改成 `AB-12-34` 而条码是 `AB1234` 时会提示一条
+     本不存在的「条码 AB1234」，可这条记录实际会以 `source='barcode'` 入库。
+
+   > 教训：这一类 bug（**拿归一化值去比自由文本**）在本步里出现了**三次**
+   > （判重红标、默认勾选闸门、条码提示）。凡是 `d.barcode`/`DeviceCandidate.sn`
+   > 这类「已知归一化」的值与 `row.sn` 这类自由文本相比，都要先归一化。
 
 3. **`rowsToRecords` 里 `sn` 存归一化值**，且 `source`/`verified` 的条码比对也改用归一化后的
    `sn`。这是有意的行为改进：条码值本身经 `toHit` → `normalizeSn` 已是纯字母数字，
