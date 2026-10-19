@@ -481,6 +481,18 @@ export function preloadOcr(): Promise<Worker> {
 const OCR_WHITELIST = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/:. '
 
 /**
+ * ⚠️ 孤儿函数（无调用方），保留但请勿当作在用代码 ——
+ *
+ * 自 Task 10 删除旧单条结果页 `ResultView.tsx` 后，`recognizeSn` 失去了唯一调用方：
+ * 整条「单拍 OCR」链路（连同其私有的 runServerOcr / extractTextStrip /
+ * cropBelowBarcode / containsBarcode）目前**既没有任何入口、也没有任何测试**，
+ * 但看起来仍像是活的，容易被后来者误以为在生效。
+ *
+ * 保留 / 删除**尚未决策**：删除时需连带更新 `multiRecognize.ts` 中以它为参照物的
+ * 设计说明注释（约 5 处）以及 `deviceFields.ts:3` 的注释，属于需要人工决策的范围。
+ * 在那之前，把它当作「无入口」的历史代码看待。
+ *
+ * —— 以下为原函数说明 ——
  * 双重识别：全量扫描条形码（本地 zxing）+ 服务端 OCR 优先（RapidOCR），
  * 服务端不可用时回退本地 Tesseract；然后比对。
  */
