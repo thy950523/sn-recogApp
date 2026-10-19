@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { extractDeviceFields, extractSnByMarker, imeiBySlot } from './deviceFields'
+import { extractDeviceFields, extractLabelFields, extractSnByMarker, imeiBySlot } from './deviceFields'
 import { snFromLine } from './multiRecognize'
 import type { ImeiField } from '@/types'
 
@@ -118,5 +118,72 @@ describe('extractDeviceFields / 既有 SN 与条码行为（回归锁）', () =>
     const r = extractDeviceFields('IMEI: 860123456789012', ['860123456789012'])
     expect(r.imeis[0].value).toBe('860123456789012')
     expect(r.imeis[0].matchedBarcode).toBe('860123456789012')
+  })
+})
+
+describe('extractLabelFields', () => {
+  it('全角冒号与半角冒号都认', () => {
+    expect(extractLabelFields('耳机型号：T0028')).toEqual([{ key: '耳机型号', value: 'T0028' }])
+    expect(extractLabelFields('耳机CMIIT ID:26J44HW2M011')).toEqual([
+      { key: '耳机CMIIT ID', value: '26J44HW2M011' },
+    ])
+  })
+
+  it('冒号后的空格不算 value 的一部分', () => {
+    expect(extractLabelFields('颜色:  星空黑')).toEqual([{ key: '颜色', value: '星空黑' }])
+  })
+
+  it('同一 key 重复出现时保留首次（多轮 OCR 拼接会产生重复行）', () => {
+    expect(extractLabelFields('颜色：星空黑\n颜色：白色')).toEqual([{ key: '颜色', value: '星空黑' }])
+  })
+
+  it('跳过已有专门列的 key，避免与 SN/IMEI 列重复', () => {
+    const text = 'S/N:A1B2C3D4E5F60001\nIMEI1: 356938035643809\nMEID: A1000000123456\nEID: 89012345678901234567890123456789'
+    expect(extractLabelFields(text)).toEqual([])
+  })
+
+  it('无冒号的行忽略（品牌行、合格标记、日期都不是字段）', () => {
+    expect(extractLabelFields('HUAWEl FreeBuds7\n合格\n2026.07')).toEqual([])
+  })
+
+  it('冒号后为空的行跳过', () => {
+    expect(extractLabelFields('颜色：')).toEqual([])
+    expect(extractLabelFields('颜色：   ')).toEqual([])
+  })
+
+  it('value 里再出现冒号时整段都算 value', () => {
+    expect(extractLabelFields('地址: A:B:C')).toEqual([{ key: '地址', value: 'A:B:C' }])
+  })
+
+  it('空文本返回空数组', () => {
+    expect(extractLabelFields('')).toEqual([])
+  })
+
+  // 真实照片（华为 FreeBuds 7 包装盒标签）的 OCR 原文，逐字照录，SN 值脱敏。
+  // 标签上的型号 / 颜色 / 执行标准 / CMIIT 都要保留下来 —— 以前这些信息全丢了，
+  // 导出到 Excel 就只剩一个 SN，出了质量问题无从追溯是哪一批、什么颜色。
+  it('真实标签：型号 / 颜色 / 执行标准 / CMIIT 全部保留，且按出现顺序', () => {
+    const ocr = [
+      '颜色：星空黑',
+      'HUAWEl FreeBuds7',
+      '耳机型号：T0028',
+      '充电盒型号：T0028C',
+      '执行标准：Q/DKBA2570-2024',
+      '耳机CMIITID:26J44HW2M011',
+      '充电盒CMIITID:26J44HW25215',
+      'oll000000ll000000l',
+      '合格',
+      'S/N:A1B2C3D4E5F60001',
+      '2026.07',
+    ].join('\n')
+
+    expect(extractLabelFields(ocr)).toEqual([
+      { key: '颜色', value: '星空黑' },
+      { key: '耳机型号', value: 'T0028' },
+      { key: '充电盒型号', value: 'T0028C' },
+      { key: '执行标准', value: 'Q/DKBA2570-2024' },
+      { key: '耳机CMIITID', value: '26J44HW2M011' },
+      { key: '充电盒CMIITID', value: '26J44HW25215' },
+    ])
   })
 })

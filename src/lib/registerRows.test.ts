@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { rowsToRecords, hasSn, isDuplicateSn, barcodeDiffers, type CandidateRow } from './registerRows'
+import {
+  rowsToRecords,
+  hasSn,
+  isDuplicateSn,
+  barcodeDiffers,
+  shouldCheckByDefault,
+  type CandidateRow,
+} from './registerRows'
 import type { DeviceCandidate } from './multiRecognize'
 
 /** 造一个字段齐全的 DeviceCandidate fixture，默认值取「无条码、仅 OCR」 */
@@ -15,6 +22,8 @@ function candidate(over: Partial<DeviceCandidate> = {}): DeviceCandidate {
     rawOcr: '',
     status: 'ocr_only',
     note: null,
+    anchor: 'marker',
+    labelFields: [],
     snBox: null,
     barcodeBoxes: [],
     ...over,
@@ -141,6 +150,33 @@ describe('rowsToRecords 字段映射', () => {
     expect(out[0].ocr).toBeNull()
   })
 
+  it('把 source 上的标签字段带进记录（导出表格要能追溯型号/颜色/CMIIT）', () => {
+    const out = rowsToRecords(
+      [
+        row({
+          source: candidate({
+            labelFields: [
+              { key: '颜色', value: '星空黑' },
+              { key: '耳机型号', value: 'T0028' },
+            ],
+          }),
+        }),
+      ],
+      null,
+    )
+    expect(out[0].labelFields).toEqual([
+      { key: '颜色', value: '星空黑' },
+      { key: '耳机型号', value: 'T0028' },
+    ])
+  })
+
+  it('没有标签字段时带空数组，不是 undefined', () => {
+    // 消费侧（Excel 导出）就不必到处写 `?? []`；undefined 与 [] 在导出里
+    // 是同一种「这行没标签信息」，两种表示并存只会多一处漏判的机会。
+    const out = rowsToRecords([row({})], null)
+    expect(out[0].labelFields).toEqual([])
+  })
+
   it('status=match 且条码与 SN 一致 → source=barcode、verified=true', () => {
     const out = rowsToRecords(
       [
@@ -258,5 +294,37 @@ describe('rowsToRecords 字段映射', () => {
   it('rawOcr 为空串时写成 null', () => {
     const out = rowsToRecords([row({ source: candidate({ rawOcr: '' }) })], null)
     expect(out[0].rawOcr).toBeNull()
+  })
+})
+
+describe('shouldCheckByDefault', () => {
+  // 这是「幽灵候选默认勾选」这个静默出错的唯一闸门。真实照片实测：
+  // 华为 FreeBuds 7 包装盒标签上，型号行与执行标准行会被兜底路径当成 SN 候选，
+  // 修复前它们和真 SN 一样默认勾选 —— 用户拍完一按「登记选中的 3 条」，
+  // 就往库里写进 2 条垃圾记录，全程没有任何提示。
+  it('marker 锚点且不重复 → 默认勾选', () => {
+    expect(shouldCheckByDefault(candidate({ sn: 'AB1234', anchor: 'marker' }), [])).toBe(true)
+  })
+
+  it('fallback 兜底候选 → 不默认勾选（要人工确认）', () => {
+    expect(shouldCheckByDefault(candidate({ sn: 'FREEBUDS7', anchor: 'fallback' }), [])).toBe(false)
+  })
+
+  it('barcode 仅条码候选 → 不默认勾选', () => {
+    // zxing 解出 isValid=true 只说明「这是个合法编码的条码」，
+    // 不说明它承载的是 SN —— 实测占位码 0000000000000 就是这样。
+    expect(shouldCheckByDefault(candidate({ sn: '0000000000000', anchor: 'barcode' }), [])).toBe(false)
+  })
+
+  it('marker 锚点但与已有记录重复 → 不默认勾选', () => {
+    expect(shouldCheckByDefault(candidate({ sn: 'AB1234', anchor: 'marker' }), ['AB1234'])).toBe(false)
+  })
+
+  it('marker 锚点但与已有记录仅分隔符不同 → 不默认勾选（按归一化比较）', () => {
+    expect(shouldCheckByDefault(candidate({ sn: 'AB1234', anchor: 'marker' }), ['ab-12-34'])).toBe(false)
+  })
+
+  it('归一化后为空的 SN → 不默认勾选（勾了也存不进，会让按钮计数与落库不一致）', () => {
+    expect(shouldCheckByDefault(candidate({ sn: '---', anchor: 'marker' }), [])).toBe(false)
   })
 })

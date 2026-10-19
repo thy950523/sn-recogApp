@@ -12,10 +12,12 @@
 
 import {
   extractDeviceFields,
+  extractLabelFields,
   extractSnByMarker,
   extractSnCandidates,
   imeiBySlot,
   NON_SN_LABEL,
+  type LabelField,
 } from './deviceFields'
 import { assignNearest, boxCenterY, normalizeBox, type Box4 } from './deviceBoxes'
 import type { VerifyStatus } from '@/types'
@@ -49,6 +51,27 @@ export interface DeviceCandidate {
   rawOcr: string
   status: VerifyStatus
   note: string | null
+  /**
+   * 这条候选凭什么成为候选 —— 决定它在确认页是否**默认勾选**。
+   *
+   * · `marker`   —— 来自显式 S/N 标记行（snAnchorFromLine）。唯一可默认勾选的等级。
+   * · `fallback` —— 来自 extractSnCandidates 兜底，无标记背书。产出但默认不勾选。
+   * · `barcode`  —— 仅条码候选，SN 直接取自 zxing 解出的条码值。
+   *
+   * `barcode` 也不默认勾选：实测 EAN13 占位码 `0000000000000` 经 zxing 解码
+   * `isValid: true` —— 校验位通过只说明「这是一个合法编码的条码」，
+   * 不说明它承载的是 SN。
+   */
+  anchor: 'marker' | 'fallback' | 'barcode'
+  /**
+   * 该设备标签上的其他信息（型号 / 颜色 / 执行标准 / CMIIT ID…）。
+   *
+   * 取自**本设备区域**的 OCR 文本，不是整图全文 —— 否则多台设备会拿到
+   * 一模一样的字段，导出后看不出来谁是谁的。
+   *
+   * 不进人工确认页：确认页只关心 SN，这些信息留给导出表格追溯用。
+   */
+  labelFields: LabelField[]
   /** 画框用：S/N 文字行的归一化坐标 */
   snBox: Box4 | null
   /** 画框用：该设备全部条码的归一化坐标 */
@@ -63,6 +86,15 @@ export interface DeviceCandidate {
  * 只用于条码；OCR 文字行不设上限，见 buildCandidates 第 2 段。
  */
 const MAX_ASSIGN_DISTANCE = 0.25
+
+/**
+ * 兜底候选的 note。
+ *
+ * 必须**覆盖**而不是拼接 '该设备未读到条码，仅 OCR 识别'：那句说的是「条码缺失」，
+ * 而这行的问题是「连 S/N 标记都没读到」—— 更严重、更需要人工核对。两句话并存
+ * 会让用户以为是前者（看一眼条码列没东西就算了），从而漏掉真正该核对的点。
+ */
+const FALLBACK_NOTE = '未读到 S/N 标记，此候选由文字推断，请人工确认'
 
 // 非 SN 标签行（EID/IMEI/…）的判断统一用 deviceFields 导出的 NON_SN_LABEL，
 // 避免与 recognize.ts 里的同一正则各写一份、日后改一处漏一处。
@@ -80,6 +112,29 @@ export function snFromLine(text: string): string | null {
 }
 
 /**
+ * 只认显式 S/N 标记的「锚点」判定 —— 决定哪条候选默认勾选。
+ *
+ * 与 snFromLine 的分工是本次修复的核心：`extractSnCandidates` 兜底会把标签上任何
+ * 8~17 位、字母数字混合的串都当成疑似 SN。实测华为 FreeBuds 7 包装盒标签上，
+ * 这会把型号行 `HUAWEl FreeBuds7`（→ FREEBUDS7）和执行标准行
+ * `执行标准：Q/DKBA2570-2024`（→ DKBA2570）都变成候选，而确认页是
+ * `checked: hasSn(d.sn)` —— 只要 SN 非空就预勾选。用户拍完照一按登记，
+ * 就往库里写进两条垃圾记录，全程无提示。
+ *
+ * 所以锚点必须来自 `extractSnByMarker`：它是**精确信号**（要求 S/N、SN、SERIAL
+ * 及其 OCR 误读变体），而不是启发式猜测。兜底候选仍然产出、仍然可见（见
+ * buildCandidates 的 fallback 分支），只是不参与默认勾选。
+ *
+ * 这里**不**套 NON_SN_LABEL 闸门（snFromLine 有）：那道闸门是给兜底路径用的，
+ * 防止它把 CMIIT/IMEI 行的值当成 SN。锚点路径已经由标记正则精确约束，
+ * 再加闸门只会误伤「型号与 S/N 印在同一行」的标签 —— 那行有真标记，就该锚上。
+ */
+export function snAnchorFromLine(text: string): string | null {
+  if (!text.trim()) return null
+  return extractSnByMarker(text)
+}
+
+/**
  * 由 OCR 行与条码构建设备候选列表（纯函数）。
  * 返回结果按纵向顺序排列（从上到下）。
  */
@@ -88,10 +143,13 @@ export function buildCandidates(
   barcodes: DetectedBarcode[],
 ): DeviceCandidate[] {
   // ---- 1. 找出 S/N 锚点行（同一 SN 只保留第一次出现的一行）----
+  // 用 snAnchorFromLine 而不是 snFromLine：锚点是「默认勾选」的依据，必须来自
+  // 显式 S/N 标记。走兜底的话，标签上的型号行、执行标准行都会变成锚点 ——
+  // 实测华为 FreeBuds 7 包装盒会凭空多出 FREEBUDS7、DKBA2570 两条候选并默认勾选。
   const anchors: { sn: string; box: Box4 }[] = []
   const seenSn = new Set<string>()
   for (const line of lines) {
-    const sn = snFromLine(line.text)
+    const sn = snAnchorFromLine(line.text)
     if (!sn || seenSn.has(sn)) continue
     seenSn.add(sn)
     anchors.push({ sn, box: line.box })
@@ -174,6 +232,8 @@ export function buildCandidates(
       rawOcr: regionText,
       status,
       note,
+      anchor: 'marker',
+      labelFields: extractLabelFields(regionText),
       snBox: anchor.box,
       barcodeBoxes: ownedBarcodes.map((b) => b.box),
     }
@@ -181,6 +241,43 @@ export function buildCandidates(
 
   // 行归属已在上面算好，这里直接按归属生成各设备候选
   const devices: DeviceCandidate[] = anchors.map((_, i) => makeFromAnchor(i))
+
+  // ---- 2b. 兜底候选：无 S/N 标记、但兜底路径认为是疑似 SN 的行 ----
+  // 产出但不默认勾选。两害相权：
+  //   · 不产出：万一某台设备标签上的 S/N 字样被 OCR 读花、又没有条码，
+  //     这台设备就一条候选都没有 —— 用户以为「没拍到」，实际是识别漏了。
+  //   · 产出但不勾选：确认页多一两行噪音，但用户看得见、判断得了。
+  // 选后者。它们**不参与条码归属**（不在 anchorBoxes 里），所以不会把
+  // 画面里无关的条码吞进自己的 barcodes —— 实测中「执行标准」行正是这样
+  // 吞掉了 EAN13 占位码。
+  const anchorSnSet = new Set(anchors.map((a) => a.sn))
+  const seenFallback = new Set<string>()
+  for (const line of lines) {
+    // 已是锚点的行跳过；标记与兜底同值时也不能重复成条（同一台设备两条候选）
+    if (snAnchorFromLine(line.text)) continue
+    const sn = snFromLine(line.text)
+    if (!sn || anchorSnSet.has(sn) || seenFallback.has(sn)) continue
+    seenFallback.add(sn)
+    devices.push({
+      sn,
+      barcode: null,
+      barcodes: [],
+      imei: null,
+      imei2: null,
+      meid: null,
+      eid: null,
+      rawOcr: line.text,
+      status: 'ocr_only',
+      note: FALLBACK_NOTE,
+      anchor: 'fallback',
+      // 从这一行取字段：幽灵候选上留着「执行标准: Q/DKBA2570-2024」是有用的，
+      // 用户一眼能看出这条噪音是从标签的哪一行冒出来的
+      labelFields: extractLabelFields(line.text),
+      // 保留真实坐标：用户能在原图上看到这条幽灵候选是从哪一行冒出来的
+      snBox: line.box,
+      barcodeBoxes: [],
+    })
+  }
 
   // ---- 3. 没有锚点但有条码：每个条码各成一条「仅条码」----
   if (!anchors.length && barcodes.length) {
@@ -196,6 +293,8 @@ export function buildCandidates(
         rawOcr: '',
         status: 'barcode_only',
         note: '未读到 S/N 文字，仅有条码',
+        anchor: 'barcode',
+        labelFields: [],
         snBox: null,
         barcodeBoxes: [b.box],
       })
@@ -217,6 +316,8 @@ export function buildCandidates(
         rawOcr: '',
         status: 'barcode_only',
         note: '该条码未匹配到任何 S/N 文字行',
+        anchor: 'barcode',
+        labelFields: [],
         snBox: null,
         barcodeBoxes: [b.box],
       })

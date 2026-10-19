@@ -36,6 +36,18 @@ export interface RecognizeOutcome {
   rawOcr: string
 }
 
+/**
+ * 标签上的一条 `key：value` 信息（型号、颜色、执行标准、CMIIT ID…）。
+ *
+ * 定义在这里而不是 deviceFields.ts：SnRecord 也要用它，而 deviceFields 已经
+ * import '@/types' —— 反过来引会成环。deviceFields 转出这个类型，保持
+ * `from './deviceFields'` 的既有引用可用。
+ */
+export interface LabelField {
+  key: string
+  value: string
+}
+
 export interface SnRecord {
   id: string
   sn: string
@@ -59,6 +71,12 @@ export interface SnRecord {
   eid?: string | null
   /** 全部 OCR 原文（提取不到字段时人工核对用） */
   rawOcr?: string | null
+  /**
+   * 标签上的其他信息（型号/颜色/执行标准/CMIIT…），导出表格追溯用。
+   *
+   * 可选：本次改动之前存下的老记录没有这个字段，读取侧要按空数组处理。
+   */
+  labelFields?: LabelField[]
   /**
    * 关联的原始照片 id（IndexedDB 主键）。
    * localStorage 只存这个 id，图片数据本身存在 IndexedDB。

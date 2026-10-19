@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildCandidates,
   markUnverified,
+  snAnchorFromLine,
   snFromLine,
   type DeviceCandidate,
   type OcrLine,
@@ -45,6 +46,33 @@ describe('snFromLine', () => {
   })
   it('普通文字行返回 null', () => {
     expect(snFromLine('MADE IN CHINA')).toBeNull()
+  })
+})
+
+describe('snAnchorFromLine', () => {
+  // 锚点与兜底必须分开：锚点决定「哪条候选默认勾选」，兜底只提供可见性。
+  // 合成一条 snFromLine 会让两者永远同进同退，幽灵候选就治不了。
+  it('S/N 标记行取标记后的值', () => {
+    expect(snAnchorFromLine('S/N:7CBXC26728002357')).toBe('7CBXC26728002357')
+  })
+
+  it('兼容 OCR 误读的标记变体', () => {
+    // extractSnByMarker 已覆盖 5/N、SIN、S\N、SERIAL NO 等；这里钉住锚点确实走了它
+    expect(snAnchorFromLine('5/N:7CBXC26728002357')).toBe('7CBXC26728002357')
+    expect(snAnchorFromLine('SERIAL NO:7CBXC26728002357')).toBe('7CBXC26728002357')
+  })
+
+  it('无标记的字母数字混合串不算锚点', () => {
+    // 这两行是真实照片上的幽灵候选来源（华为 FreeBuds 7 包装盒标签）。
+    // 它们经兜底 extractSnCandidates 仍会被 snFromLine 取到 —— 那是**有意**的：
+    // 候选要可见，只是不能默认勾选。
+    expect(snAnchorFromLine('HUAWEl FreeBuds7')).toBeNull()
+    expect(snAnchorFromLine('执行标准：Q/DKBA2570-2024')).toBeNull()
+  })
+
+  it('非 SN 标签行不算锚点', () => {
+    expect(snAnchorFromLine('耳机CMIITID:26J44HW2M011')).toBeNull()
+    expect(snAnchorFromLine('IMEI1 356938035643809')).toBeNull()
   })
 })
 
@@ -252,8 +280,188 @@ describe('buildCandidates', () => {
     expect(buildCandidates(lines, [])).toHaveLength(1)
   })
 
+  // ↓ 锚点分级：真实照片（华为 FreeBuds 7 包装盒标签）实测出的静默出错。
+  //   标签上无 S/N 标记的型号行、执行标准行会被兜底路径当成 SN 候选，
+  //   而确认页 `checked: hasSn(d.sn)` 只要 SN 非空就预勾选 —— 一按登记就写进垃圾。
+
+  it('有标记的候选标 marker，无标记的兜底候选标 fallback', () => {
+    const lines = [
+      line('HUAWEl FreeBuds7', 0.10, 0.14),
+      line('执行标准：Q/DKBA2570-2024', 0.15, 0.19),
+      line('S/N: 8A7C2D1E', 0.60, 0.64),
+    ]
+    const barcodes = [bar('8A7C2D1E', 0.55, 0.59)]
+    const bySn = new Map(buildCandidates(lines, barcodes).map((d) => [d.sn, d]))
+
+    expect(bySn.get('8A7C2D1E')).toMatchObject({ anchor: 'marker', status: 'match' })
+    // 兜底候选仍要产出（可见），只是不参与默认勾选
+    expect(bySn.get('FREEBUDS7')).toMatchObject({ anchor: 'fallback' })
+    expect(bySn.get('DKBA2570')).toMatchObject({ anchor: 'fallback' })
+  })
+
+  it('兜底候选的 note 点名它没被 S/N 标记确认', () => {
+    const [d] = buildCandidates([line('HUAWEl FreeBuds7', 0.10, 0.14)], [])
+    // 断言全等而不是 toContain：要锁住 note 是「覆盖」。
+    // 若实现改成在 '该设备未读到条码，仅 OCR 识别' 后面拼接，toContain 仍然会绿。
+    expect(d.note).toBe('未读到 S/N 标记，此候选由文字推断，请人工确认')
+  })
+
+  it('兜底候选不认领条码，占位码独立成条', () => {
+    // 这是真实照片的几何：EAN13 占位码紧贴「执行标准」行，离真 S/N 行很远。
+    // 修复前「执行标准」行是锚点，会把占位码吞进自己的 barcodes；
+    // 修复后它只是 fallback 候选，不参与条码归属，占位码必须自己成条。
+    const lines = [
+      line('HUAWEl FreeBuds7', 0.10, 0.14),
+      line('执行标准：Q/DKBA2570-2024', 0.15, 0.19),
+      line('S/N: 8A7C2D1E', 0.60, 0.64),
+    ]
+    const barcodes = [
+      bar('0000000000000', 0.12, 0.16), // 中心 0.14，到执行标准行距离 0.01
+      bar('8A7C2D1E', 0.55, 0.59),
+    ]
+    const bySn = new Map(buildCandidates(lines, barcodes).map((d) => [d.sn, d]))
+
+    expect(bySn.get('DKBA2570')).toMatchObject({ anchor: 'fallback', barcodes: [], status: 'ocr_only' })
+    expect(bySn.get('0000000000000')).toMatchObject({
+      anchor: 'barcode',
+      status: 'barcode_only',
+      barcode: '0000000000000',
+    })
+  })
+
+  it('纯条码候选（无任何 S/N 文字）标 barcode', () => {
+    const devices = buildCandidates([], [bar('8A7C2D1E', 0.05, 0.09)])
+    expect(devices[0].anchor).toBe('barcode')
+  })
+
+  it('每条候选带上自己区域内的标签字段', () => {
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.10, 0.14),
+      line('颜色：星空黑', 0.15, 0.19),
+      line('耳机型号：T0028', 0.20, 0.24),
+    ]
+    const [d] = buildCandidates(lines, [])
+    expect(d.labelFields).toEqual([
+      { key: '颜色', value: '星空黑' },
+      { key: '耳机型号', value: 'T0028' },
+    ])
+  })
+
+  it('两台设备各自的标签字段不串台', () => {
+    // 这是本字段最容易错的地方：若从**整图** OCR 全文提取（而不是本设备区域），
+    // 两台设备会拿到一模一样的字段 —— 导出到 Excel 后，两台设备的颜色都是
+    // 其中一台的，而且看不出来。文字行归组（lineOwner）保证各取各的。
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.10, 0.14),
+      line('颜色：星空黑', 0.15, 0.19),
+      line('S/N: 9B8D3E2F', 0.60, 0.64),
+      line('颜色：白色', 0.65, 0.69),
+    ]
+    const bySn = new Map(buildCandidates(lines, []).map((d) => [d.sn, d]))
+    expect(bySn.get('8A7C2D1E')!.labelFields).toEqual([{ key: '颜色', value: '星空黑' }])
+    expect(bySn.get('9B8D3E2F')!.labelFields).toEqual([{ key: '颜色', value: '白色' }])
+  })
+
+  it('没有任何标签字段时是空数组，不是 undefined', () => {
+    const [d] = buildCandidates([line('S/N: 8A7C2D1E', 0.10, 0.14)], [])
+    expect(d.labelFields).toEqual([])
+  })
+
+  it('兜底候选也从自己那一行取标签字段', () => {
+    // 幽灵候选上留着「执行标准: Q/DKBA2570-2024」是有用的：
+    // 用户一眼能看出这条噪音是从标签的哪一行冒出来的。
+    const [d] = buildCandidates([line('执行标准：Q/DKBA2570-2024', 0.10, 0.14)], [])
+    expect(d.anchor).toBe('fallback')
+    expect(d.labelFields).toEqual([{ key: '执行标准', value: 'Q/DKBA2570-2024' }])
+  })
+
+  it('同一条兜底行重复出现时只成一条 fallback 候选', () => {
+    const lines = [
+      line('HUAWEl FreeBuds7', 0.10, 0.14),
+      line('HUAWEl FreeBuds7', 0.30, 0.34),
+    ]
+    expect(buildCandidates(lines, []).map((d) => d.sn)).toEqual(['FREEBUDS7'])
+  })
+
+  it('兜底候选与锚点同值时不再另起一条', () => {
+    // 标记行与无标记行给出同一个值时，锚点那条已经代表了这台设备。
+    // 不排除的话会多出一条 fallback 候选，用户可能把同一台设备登记两次。
+    const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14), line('8A7C2D1E', 0.30, 0.34)]
+    const devices = buildCandidates(lines, [])
+    expect(devices).toHaveLength(1)
+    expect(devices[0].anchor).toBe('marker')
+  })
+
   it('什么都识别不到时返回空数组', () => {
     expect(buildCandidates([], [])).toEqual([])
+  })
+})
+
+/**
+ * 真实照片回归：华为 FreeBuds 7 包装盒标签（1500×2000，竖构图）。
+ *
+ * 数据是 RapidOCR sidecar 与 zxing-wasm 在**那张照片上跑出来的原始输出**，
+ * 逐字照录 —— 文本、置信度、归一化坐标都是真的。唯一改动：SN 值脱敏
+ * （原值 → `A1B2C3D4E5F60001`，同长度、同「字母数字混合」结构），
+ * 免得真实设备序列号进仓库。被测的是解析逻辑，不是这个具体值。
+ *
+ * 这条 fixture 钉住的是「标签上的型号行、执行标准行不得成为锚点」：
+ *   · `HUAWEl FreeBuds7`        → 兜底候选 FREEBUDS7
+ *   · `执行标准：Q/DKBA2570-2024` → 兜底候选 DKBA2570
+ * 修复前这两行都是锚点、都默认勾选，用户拍完一按登记就写进两条垃圾记录。
+ */
+describe('真实照片回归：FreeBuds 7 包装盒标签', () => {
+  const LINES: OcrLine[] = [
+    { text: '颜色：星空黑', conf: 0.967, box: [0.1547, 0.246, 0.3033, 0.2705] },
+    { text: 'HUAWEl FreeBuds7', conf: 0.951, box: [0.1553, 0.177, 0.422, 0.2005] },
+    { text: '耳机型号：T0028', conf: 0.987, box: [0.1553, 0.1995, 0.3553, 0.223] },
+    { text: '充电盒型号：T0028C', conf: 0.99, box: [0.1553, 0.2225, 0.4007, 0.2485] },
+    { text: '执行标准：Q/DKBA2570-2024', conf: 0.975, box: [0.1547, 0.2705, 0.5073, 0.2955] },
+    { text: '耳机CMIITID:26J44HW2M011', conf: 0.972, box: [0.1547, 0.2925, 0.5193, 0.32] },
+    { text: '充电盒CMIITID:26J44HW25215', conf: 0.977, box: [0.1553, 0.317, 0.5373, 0.3415] },
+    { text: 'oll000000ll000000l', conf: 0.703, box: [0.5833, 0.2685, 0.8627, 0.2915] },
+    { text: '合格', conf: 0.859, box: [0.7773, 0.336, 0.8107, 0.387] },
+    { text: 'S/N:A1B2C3D4E5F60001', conf: 0.98, box: [0.156, 0.4035, 0.4687, 0.425] },
+    { text: '2026.07', conf: 0.999, box: [0.744, 0.3845, 0.8427, 0.4065] },
+  ]
+
+  const BARS = [
+    { value: 'A1B2C3D4E5F60001', box: [0.1587, 0.35, 0.6267, 0.3975] as Box4 },
+    { value: '0000000000000', box: [0.608, 0.213, 0.866, 0.261] as Box4 },
+  ]
+
+  it('只有一条候选来自 S/N 标记 —— 也就是唯一会被默认勾选的那条', () => {
+    const devices = buildCandidates(LINES, BARS)
+    const markers = devices.filter((d) => d.anchor === 'marker')
+    expect(markers).toHaveLength(1)
+    expect(markers[0].sn).toBe('A1B2C3D4E5F60001')
+    expect(markers[0].status).toBe('match')
+    expect(markers[0].barcode).toBe('A1B2C3D4E5F60001')
+  })
+
+  it('型号行与执行标准行降为 fallback 候选', () => {
+    const bySn = new Map(buildCandidates(LINES, BARS).map((d) => [d.sn, d]))
+    expect(bySn.get('FREEBUDS7')).toMatchObject({ anchor: 'fallback' })
+    expect(bySn.get('DKBA2570')).toMatchObject({ anchor: 'fallback' })
+    // 这两条都是噪音，不该认领任何条码
+    expect(bySn.get('FREEBUDS7')!.barcodes).toEqual([])
+    expect(bySn.get('DKBA2570')!.barcodes).toEqual([])
+  })
+
+  it('EAN13 占位码脱离幽灵候选，独立成条且不默认勾选', () => {
+    const bySn = new Map(buildCandidates(LINES, BARS).map((d) => [d.sn, d]))
+    expect(bySn.get('0000000000000')).toMatchObject({
+      anchor: 'barcode',
+      status: 'barcode_only',
+    })
+  })
+
+  it('四条候选里只有一条是 marker（其余三条都要人工确认）', () => {
+    const devices = buildCandidates(LINES, BARS)
+    expect(devices).toHaveLength(4)
+    expect(devices.filter((d) => d.anchor === 'marker')).toHaveLength(1)
+    expect(devices.filter((d) => d.anchor === 'fallback')).toHaveLength(2)
+    expect(devices.filter((d) => d.anchor === 'barcode')).toHaveLength(1)
   })
 })
 
@@ -269,6 +477,8 @@ describe('markUnverified', () => {
     rawOcr: '',
     status: 'ocr_only',
     note: null,
+    anchor: 'marker',
+    labelFields: [],
     snBox: [0.1, 0.1, 0.9, 0.14],
     barcodeBoxes: [],
     ...over,

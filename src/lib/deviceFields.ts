@@ -4,7 +4,7 @@
  * 连续扫描 RapidOCR/Tesseract 全文）共用本模块。
  */
 
-import type { ImeiField, MatchedField } from '@/types'
+import type { ImeiField, LabelField, MatchedField } from '@/types'
 
 /** 归一化：大写、去掉非字母数字字符 */
 export function normalizeSn(s: string): string {
@@ -205,6 +205,52 @@ export function imeiBySlot(imeis: readonly ImeiField[], slot: 1 | 2): string | n
 
 /** 带 EID/IMEI 等标签前缀的行——那些行印的本来就不是 SN */
 export const NON_SN_LABEL = /EID|IMEI|CMIIT|MEID|MODEL|UPC|EAN/i
+
+/** 标签字段的类型定义在 '@/types'（SnRecord 也要用），这里转出以保持既有引用可用 */
+export type { LabelField }
+
+/**
+ * 已被专门列接管的 key（按 normalizeSn 归一化后比较）。
+ *
+ * 归一化是必须的：标签上印的是 `S/N`，归一化后才是 `SN`。直接比对原文的话，
+ * `S/N:A1B2...` 会变成一条 key 为「S/N」的标签字段，与 SN 列重复。
+ */
+const DEDICATED_KEYS = new Set(['SN', 'IMEI', 'IMEI1', 'IMEI2', 'MEID', 'EID'])
+
+/**
+ * 从 OCR 文本里提取标签上的其他信息（型号 / 颜色 / 执行标准 / CMIIT ID…）。
+ *
+ * 用**通用**的 `key：value` 解析，不写品牌字段白名单：白名单能覆盖华为，
+ * 换小米、苹果就得再写一套，维护成本随品牌数线性增长，且漏掉新品牌时是
+ * 静默丢失。而设备标签的排版惯例就是「标签名：值」，通用解析能跨品牌工作。
+ *
+ * 全角 `：` 与半角 `:` 都认 —— OCR 对两者都可能输出。
+ * 无冒号的行（品牌行 `HUAWEl FreeBuds7`、`合格`、日期 `2026.07`）不是字段，
+ * 它们留在 rawOcr 原文里，需要时人工看。
+ *
+ * 只做提取，不做语义校验：值长什么样就存什么样。这些字段不参与 SN 判定，
+ * 也不进人工确认页 —— 确认页只关心 SN，其他信息是留给导出表格追溯用的。
+ */
+export function extractLabelFields(rawText: string): LabelField[] {
+  const out: LabelField[] = []
+  const seen = new Set<string>()
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    // key 限 1~24 字符且惰性匹配，遇到**第一个**冒号就断开：
+    // 值里含冒号（如 `地址: A:B:C`）时整段仍算 value，不被二次切开。
+    const m = rawLine.match(/^\s*(.{1,24}?)\s*[：:]\s*(\S.*)$/)
+    if (!m) continue
+    const key = m[1].trim()
+    const value = m[2].trim()
+    // 冒号后为空（`颜色：`）不算字段 —— 存一条空值只会在表格里占一列
+    if (!key || !value) continue
+    if (DEDICATED_KEYS.has(normalizeSn(key))) continue
+    // 同 key 保留首次：多轮 OCR 拼接会让同一行出现两次
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ key, value })
+  }
+  return out
+}
 
 /** 抹掉 CMIIT ID、IMEI 等非 SN 字段，防止兜底候选误取 */
 function stripNonSnLabels(text: string): string {

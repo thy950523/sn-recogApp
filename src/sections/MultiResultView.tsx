@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { recognizeMulti, type MultiRecognizeResult } from '@/lib/multiRecognize'
-import { rowsToRecords, hasSn, isDuplicateSn, barcodeDiffers, type CandidateRow } from '@/lib/registerRows'
+import {
+  rowsToRecords,
+  hasSn,
+  isDuplicateSn,
+  barcodeDiffers,
+  shouldCheckByDefault,
+  type CandidateRow,
+} from '@/lib/registerRows'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
 
@@ -169,24 +176,15 @@ export default function MultiResultView({
   useEffect(() => {
     if (!result) return
     setRows(
-      result.devices.map((d) => {
-        // 与红标（isDuplicate）共用同一个归一化判据，否则会出现「红标说重复、
-        // 勾选框却默认勾上」的自相矛盾。isDuplicateSn 两侧都归一化，所以这里
-        // 不再依赖「d.sn 恒已归一化」这个不变量 —— 将来多一条候选产出路径忘了
-        // 归一化，这个默认勾选闸门也不会静默失效。
-        const dup = isDuplicateSn(d.sn, existingRef.current)
-        return {
-          sn: d.sn,
-          // 默认勾选；与已有记录重复的默认不勾，避免误登记。
-          //
-          // 判据必须走 hasSn，不能退回 `!!d.sn`：勾选闸门与 checkedCount、
-          // rowsToRecords 的过滤必须同判据。当前 d.sn 恒为纯字母数字，两者等价；
-          // 但将来某条候选产出路径给出 "---"（归一化后为空）时，`!!d.sn` 会勾上
-          // 一行、按钮计数却不含它 —— 界面自相矛盾。
-          checked: hasSn(d.sn) && !dup,
-          source: d,
-        }
-      }),
+      result.devices.map((d) => ({
+        sn: d.sn,
+        // 判据抽在 registerRows.shouldCheckByDefault 里，有单测锁住：
+        // 「只有显式 S/N 标记背书的候选才默认勾选」是这个页面最容易静默出错的
+        // 一条规则（幽灵候选被一起登记进库），而它原先埋在这个 effect 里，
+        // 任何单测都够不着。
+        checked: shouldCheckByDefault(d, existingRef.current),
+        source: d,
+      })),
     )
   }, [result])
 

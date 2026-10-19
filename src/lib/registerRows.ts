@@ -53,6 +53,31 @@ export function isDuplicateSn(sn: string, others: readonly string[]): boolean {
 }
 
 /**
+ * 这条候选在确认页是否**默认勾选**。
+ *
+ * 抽成纯函数是为了能测：这是「幽灵候选被静默登记」的唯一闸门，而它此前埋在
+ * MultiResultView 的 effect 里，任何单测都够不着。真实照片实测（华为 FreeBuds 7
+ * 包装盒标签）：标签上的型号行 `HUAWEl FreeBuds7` 与执行标准行
+ * `执行标准：Q/DKBA2570-2024` 会被兜底路径当成 SN 候选，修复前它们和真 SN
+ * 一样默认勾选 —— 用户拍完一按「登记选中的 3 条」，就往库里写进 2 条垃圾记录。
+ *
+ * 三个条件缺一不可：
+ *   · `anchor === 'marker'` —— 只有显式 S/N 标记行背书的候选才自动勾选。
+ *     兜底候选（型号/标准行）与仅条码候选（占位码 `0000000000000` 经 zxing
+ *     解码 isValid=true）都不够格，它们仍然列出，但必须人工点一下。
+ *   · `hasSn` —— 归一化后非空。勾了也存不进（rowsToRecords 会过滤掉），
+ *     会让「登记选中的 N 条」与实际落库条数不一致。
+ *   · 不与已有记录重复 —— 与 isDuplicateSn 共用归一化判据，避免出现
+ *     「红标说重复、勾选框却默认勾上」的自相矛盾。
+ */
+export function shouldCheckByDefault(
+  device: DeviceCandidate,
+  existingSns: readonly string[],
+): boolean {
+  return device.anchor === 'marker' && hasSn(device.sn) && !isDuplicateSn(device.sn, existingSns)
+}
+
+/**
  * 是否需要在候选行上提示「条码 X」。
  *
  * 只在条码与（归一化后的）SN 确实不同时才提示。用原始 `sn` 比会出错：
@@ -99,6 +124,9 @@ export function rowsToRecords(
         meid: r.source.meid,
         eid: r.source.eid,
         rawOcr: r.source.rawOcr || null,
+        // 标签字段原样带过去（含空数组）：undefined 与 [] 在导出侧是同一种
+        // 「这行没标签信息」，两种表示并存只会多一处漏判的机会。
+        labelFields: r.source.labelFields,
         imageId: imageId ?? undefined,
       }
     })
