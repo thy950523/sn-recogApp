@@ -569,7 +569,7 @@ git commit -m "feat(image): IndexedDB 图片仓库，压缩存储与 Object URL 
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { collectImageIds } from './store'
+import { collectImageIds, orphanedImageIds } from './store'
 import type { SnRecord } from '@/types'
 
 const rec = (id: string, imageId?: string): SnRecord => ({
@@ -594,6 +594,33 @@ describe('collectImageIds', () => {
 
   it('无图时返回空数组', () => {
     expect(collectImageIds([rec('1')])).toEqual([])
+  })
+})
+
+describe('orphanedImageIds', () => {
+  it('图片被剩余记录共用时不得删除', () => {
+    // 一图三码：三条记录共用同一张照片
+    const records = [rec('1', 'img-shared'), rec('2', 'img-shared'), rec('3', 'img-shared')]
+    expect(orphanedImageIds(records, ['1'])).toEqual([])
+  })
+
+  it('图片只被被删记录引用时才删除', () => {
+    const records = [rec('1', 'img-a'), rec('2', 'img-b')]
+    expect(orphanedImageIds(records, ['1'])).toEqual(['img-a'])
+  })
+
+  it('混合场景：共用的保留，独占的删除', () => {
+    const records = [rec('1', 'img-shared'), rec('2', 'img-own'), rec('3', 'img-shared')]
+    expect(orphanedImageIds(records, ['1', '2'])).toEqual(['img-own'])
+  })
+
+  it('重复引用同一图片时结果去重', () => {
+    const records = [rec('1', 'img-a'), rec('2', 'img-a')]
+    expect(orphanedImageIds(records, ['1', '2'])).toEqual(['img-a'])
+  })
+
+  it('无图记录返回空数组', () => {
+    expect(orphanedImageIds([rec('1')], ['1'])).toEqual([])
   })
 })
 ```
@@ -642,15 +669,37 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
 > 而且 `void deleteImages(...)` 没有 `.catch()`，失败会产生 unhandled rejection。
 > 改为：副作用放在 updater **外面**，用当前 `records` 取值，并加 `.catch()`。
 
+> **修订（Task 4 执行前，重要）**：原规格按「一条记录一张图」写，直接
+> `deleteImages([target.imageId])`。但一图多码场景下**一张照片会挂多条记录**（同一
+> `imageId`）—— 删掉其中一条就会把兄弟记录还在用的照片删掉，缩略图随即失效。
+> 改为按引用计数：只删「这批记录删掉后不再被任何剩余记录引用」的图片。
+> 判断逻辑抽成纯函数 `orphanedImageIds`，可单测。
+
+```ts
+/**
+ * 计算删除这批记录后，哪些图片不再被任何剩余记录引用（可安全删除）。
+ *
+ * 一图多码场景下一张照片会挂多条记录（同一 imageId），
+ * 只删其中一条时不能把兄弟记录还在用的图删掉。
+ */
+export function orphanedImageIds(
+  records: (SnRecord | ContinuousScanRecord)[],
+  removedIds: string[],
+): string[] {
+  const removed = new Set(removedIds)
+  const stillUsed = new Set(collectImageIds(records.filter((r) => !removed.has(r.id))))
+  const candidates = collectImageIds(records.filter((r) => removed.has(r.id)))
+  return [...new Set(candidates)].filter((id) => !stillUsed.has(id))
+}
+```
+
 ```ts
   const remove = useCallback(
     (id: string) => {
-      const target = records.find((r) => r.id === id)
+      const imageIds = orphanedImageIds(records, [id])
       setRecords((prev) => prev.filter((r) => r.id !== id))
-      if (target?.imageId) {
-        void deleteImages([target.imageId]).catch((e) =>
-          console.warn('[image] 删除图片失败:', e),
-        )
+      if (imageIds.length) {
+        void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
       }
     },
     [records],
@@ -658,8 +707,8 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
 
   const removeMany = useCallback(
     (ids: string[]) => {
+      const imageIds = orphanedImageIds(records, ids)
       const set = new Set(ids)
-      const imageIds = collectImageIds(records.filter((r) => set.has(r.id)))
       setRecords((prev) => prev.filter((r) => !set.has(r.id)))
       if (imageIds.length) {
         void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
@@ -669,14 +718,16 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
   )
 ```
 
-把 `clear` 改为联动删图：
+把 `clear` 改为联动删图（全删时剩余记录为空集，所有图都可删，但仍需去重）：
 
 ```ts
   const clear = useCallback(() => {
     const imageIds = collectImageIds(records)
     setRecords([])
     if (imageIds.length) {
-      void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
+      void deleteImages([...new Set(imageIds)]).catch((e) =>
+        console.warn('[image] 删除图片失败:', e),
+      )
     }
   }, [records])
 ```
@@ -719,7 +770,7 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
 npx vitest run src/lib/store.test.ts && npx tsc -b
 ```
 
-Expected: `2 passed`，类型检查无错误。
+Expected: `7 passed`（`collectImageIds` 2 条 + `orphanedImageIds` 5 条），类型检查无错误。
 
 **Step 6: Commit**
 
