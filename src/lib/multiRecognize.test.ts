@@ -9,9 +9,16 @@ const line = (text: string, y0: number, y1: number, x0 = 0.1, x1 = 0.9): OcrLine
   box: [x0, y0, x1, y1],
 })
 
-const bar = (value: string, y0: number, y1: number): { value: string; box: Box4 } => ({
+// x0/x1 可选：默认跨满 0.1~0.9（竖构图用例），横构图用例要能指定各自的列
+const bar = (
+  value: string,
+  y0: number,
+  y1: number,
+  x0 = 0.1,
+  x1 = 0.9,
+): { value: string; box: Box4 } => ({
   value,
-  box: [0.1, y0, 0.9, y1],
+  box: [x0, y0, x1, y1],
 })
 
 describe('snFromLine', () => {
@@ -125,6 +132,80 @@ describe('buildCandidates', () => {
     const lines = [line('S/N: 9B8D3E2F', 0.60, 0.64), line('S/N: 8A7C2D1E', 0.10, 0.14)]
     const devices = buildCandidates(lines, [])
     expect(devices.map((d) => d.sn)).toEqual(['8A7C2D1E', '9B8D3E2F'])
+  })
+
+  // ↓ 以下 4 条是「横构图串台 / 真 SN 被顶掉 / 同台设备两条候选 / IMEI 静默丢失」的回归用例。
+  //   修复前它们全部会失败，且都是**静默**出错（status 照样是 match/ocr_only，不报警）。
+
+  it('三台设备左右并排时，各自的条码与 IMEI 都不被邻居抢走', () => {
+    // 左列 x0.02~0.32 / 中列 0.36~0.66 / 右列 0.70~0.98；锚点中心 y 只差 0.02。
+    // 只看 y 时三条条码会全部归给左设备、左设备的 IMEI 会挂到中设备上、
+    // 另外两个 IMEI 直接消失。
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.50, 0.54, 0.02, 0.32),
+      line('IMEI1 356938035643801', 0.56, 0.60, 0.02, 0.32),
+      line('S/N: 9B8D3E2F', 0.52, 0.56, 0.36, 0.66),
+      line('IMEI1 356938035643902', 0.58, 0.62, 0.36, 0.66),
+      line('S/N: 7C6E5D4A', 0.505, 0.545, 0.70, 0.98),
+      line('IMEI1 356938035643703', 0.565, 0.605, 0.70, 0.98),
+    ]
+    const barcodes = [
+      bar('8A7C2D1E', 0.45, 0.49, 0.02, 0.32),
+      bar('9B8D3E2F', 0.47, 0.51, 0.36, 0.66),
+      bar('7C6E5D4A', 0.455, 0.495, 0.70, 0.98),
+    ]
+    const devices = buildCandidates(lines, barcodes)
+    expect(devices).toHaveLength(3)
+    // 返回顺序由 snBox 中心 y 决定，与本次断言无关，故按 sn 建索引查
+    const bySn = new Map(devices.map((d) => [d.sn, d]))
+    expect([...bySn.keys()].sort()).toEqual(['7C6E5D4A', '8A7C2D1E', '9B8D3E2F'])
+    expect(bySn.get('8A7C2D1E')).toMatchObject({
+      barcode: '8A7C2D1E',
+      imei: '356938035643801',
+      status: 'match',
+    })
+    expect(bySn.get('9B8D3E2F')).toMatchObject({
+      barcode: '9B8D3E2F',
+      imei: '356938035643902',
+      status: 'match',
+    })
+    expect(bySn.get('7C6E5D4A')).toMatchObject({
+      barcode: '7C6E5D4A',
+      imei: '356938035643703',
+      status: 'match',
+    })
+  })
+
+  it('图里出现重复的 SN 文本时，锚点自己的 SN 不被邻居那行顶掉', () => {
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.10, 0.14),
+      line('S/N: 8A7C2D1E', 0.30, 0.34),
+      line('S/N: 9B8D3E2F', 0.42, 0.46),
+    ]
+    const devices = buildCandidates(lines, [])
+    // 重复的 SN 只成一条候选；第二个锚点锚在 9B8D3E2F 上，就必须报 9B8D3E2F。
+    // 用 fields.sn 覆盖时会取到区域内第一行（8A7C2D1E），真 SN 静默丢失。
+    expect(devices.map((d) => d.sn)).toEqual(['8A7C2D1E', '9B8D3E2F'])
+  })
+
+  it('单台设备的条码离自己的 SN 行较远时，不另起一条重复候选', () => {
+    const lines = [line('S/N: 8A7C2D1E', 0.05, 0.09)]
+    // 条码中心 0.42，到 SN 框的距离 0.42-0.09 = 0.33，超过 MAX_ASSIGN_DISTANCE
+    const devices = buildCandidates(lines, [bar('8A7C2D1E', 0.40, 0.44)])
+    // 修复前会补一条同 SN 的 barcode_only，两条都默认勾选 → 用户登记两次
+    expect(devices).toHaveLength(1)
+    expect(devices[0].barcode).toBe('8A7C2D1E')
+    expect(devices[0].status).toBe('match')
+  })
+
+  it('单台设备时，离 SN 行较远的 IMEI 行仍归给它（文字行不设距离上限）', () => {
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.05, 0.09),
+      line('IMEI1 356938035643809', 0.50, 0.54),
+    ]
+    const [d] = buildCandidates(lines, [])
+    // 距离 0.43 远超 0.25：若文字行也设上限，这个 IMEI 会被静默丢掉
+    expect(d.imei).toBe('356938035643809')
   })
 
   it('同一 S/N 重复出现时只保留一条', () => {

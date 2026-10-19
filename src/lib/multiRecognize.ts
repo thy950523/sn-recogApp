@@ -16,7 +16,7 @@ import {
   extractSnCandidates,
   NON_SN_LABEL,
 } from './deviceFields'
-import { assignByNearestY, boxCenterY, type Box4 } from './deviceBoxes'
+import { assignNearest, boxCenterY, type Box4 } from './deviceBoxes'
 import type { VerifyStatus } from '@/types'
 
 /** OCR 返回的一行文字及其归一化坐标 */
@@ -54,7 +54,13 @@ export interface DeviceCandidate {
   barcodeBoxes: Box4[]
 }
 
-/** 归类距离上限（归一化纵向距离）。设备摆得再开，一屏内也远小于 0.25 */
+/**
+ * 条码归组的距离上限（归一化）。
+ * 语义是「条码中心 → S/N 文字框的最短距离」，**不是**两个中心之间的距离
+ * （见 deviceBoxes.pointToBoxDistance 的说明）。
+ * 0.25 约等于「一屏 4 台设备」时每台所占的高度量级。
+ * 只用于条码；OCR 文字行不设上限，见 buildCandidates 第 2 段。
+ */
 const MAX_ASSIGN_DISTANCE = 0.25
 
 // 非 SN 标签行（EID/IMEI/…）的判断统一用 deviceFields 导出的 NON_SN_LABEL，
@@ -89,29 +95,52 @@ export function buildCandidates(
     seenSn.add(sn)
     anchors.push({ sn, box: line.box })
   }
-  // 按中心 y 升序：assignByNearestY 的 tie-break 是「取下标较小」，
+  // 按中心 y 升序：assignNearest 的 tie-break 是「取下标较小」，
   // 只有锚点有序时它才等价于「几何上靠上」；也顺带让条码归属不受输入顺序影响。
   anchors.sort((a, b) => boxCenterY(a.box) - boxCenterY(b.box))
 
   const anchorBoxes = anchors.map((a) => a.box)
 
   // ---- 2. 条码归到最近的锚点；无锚点时每个条码自成一条 ----
-  const barcodeOwner = assignByNearestY(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
-  // 行归属：同样按 y 就近归到锚点（锚点自身距离为 0，必然归给自己）
-  const lineOwner = assignByNearestY(lines, anchorBoxes, MAX_ASSIGN_DISTANCE)
+  const barcodeOwner = assignNearest(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
+  // 行归属：同样按二维就近归到锚点（锚点自身距离为 0，必然归给自己）。
+  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**：
+  // 一行没归到任何设备 = 静默丢掉一个 IMEI/EID，比归错（界面上看得见、能改）更糟。
+  // 条码则相反：画面里可能有不属于任何设备的条码（包装箱上的码），所以要设上限。
+  const lineOwner = assignNearest(lines, anchorBoxes, Infinity)
+
+  // 未被任何锚点认领、但值与某个锚点 SN 相同的条码：直接归给那个锚点。
+  // 不这么做它会在第 4 段另起一条 barcode_only，与锚点候选重复 ——
+  // 同一台设备出现两条默认勾选的候选，用户会把它登记两次。
+  // 触发条件：设备自己的条码离自己的 SN 行超过 MAX_ASSIGN_DISTANCE（如单台大设备占满画面）。
+  const effectiveOwner = [...barcodeOwner]
+  const anchorBySn = new Map(anchors.map((a, i) => [a.sn, i]))
+  barcodes.forEach((b, i) => {
+    if (effectiveOwner[i] !== -1) return
+    const hit = anchorBySn.get(b.value)
+    if (hit !== undefined) effectiveOwner[i] = hit
+  })
 
   const makeFromAnchor = (index: number): DeviceCandidate => {
     const anchor = anchors[index]
-    const ownedBarcodes = barcodes.filter((_, i) => barcodeOwner[i] === index)
+    const ownedBarcodes = barcodes.filter((_, i) => effectiveOwner[i] === index)
     // 该设备区域的 OCR 行：就近归组，锚点自身也算
     const ownedLines = lines.filter((_, i) => lineOwner[i] === index)
     const regionText = ownedLines.map((l) => l.text).join('\n')
     const allBarcodeValues = ownedBarcodes.map((b) => b.value)
 
     const fields = extractDeviceFields(regionText, allBarcodeValues)
-    // 锚点行本身可能是 "S/N: XXX"，extractDeviceFields 也能取到；取不到就用锚点值
-    const sn = fields.sn?.value ?? anchor.sn
+    // SN 以锚点为准，**不要**用 fields.sn 覆盖：regionText 是本区域全部行的拼接，
+    // 而 extractDeviceFields 取的是其中**第一个** S/N 标记行。图里一旦出现重复的 SN 文本
+    // （同一张标签被拍到两次、或 OCR 重复输出），邻居那行会排在锚点自己那行前面，
+    // 真 SN 就被顶掉、静默变成别人的 SN。
+    // 实测：S/N 行依次为 8A7C2D1E@0.12 / 8A7C2D1E@0.32 / 9B8D3E2F@0.42 时，
+    // 第二个锚点（锚在 9B8D3E2F 上）产出的是 8A7C2D1E，真值彻底丢失。
+    const sn = anchor.sn
 
+    // 精确比较即可：条码值在 recognize.ts 的 toHit 里已过 normalizeSn（大写、只留字母数字），
+    // SN 也来自 extractSnByMarker / extractSnCandidates（同样已大写化、去分隔符）。
+    // 若日后有调用方直接传入未归一化的值，再改用 deviceFields 的 matchBarcode 归一化比较。
     const matched = allBarcodeValues.find((b) => b === sn) ?? null
     let status: VerifyStatus
     if (allBarcodeValues.length && matched) status = 'match'
@@ -163,7 +192,7 @@ export function buildCandidates(
 
   // ---- 4. 有锚点但有条码未被任何锚点认领：各成一条，避免漏登记 ----
   if (anchors.length) {
-    const unowned = barcodes.filter((_, i) => barcodeOwner[i] === -1)
+    const unowned = barcodes.filter((_, i) => effectiveOwner[i] === -1)
     for (const b of unowned) {
       devices.push({
         sn: b.value,

@@ -1548,7 +1548,7 @@ npx vitest run src/lib/multiRecognize.test.ts
 
 Expected: **19 passed**（`snFromLine` 5 条 + `buildCandidates` 14 条；全仓 `npx vitest run` 应为 **60 passed**）。
 **若「同一条码只被一台设备认领」或「条码落在两个 S/N 行之间」
-用例失败**，说明 `assignByNearestY` 的归组结果与预期不符 —— 检查 `MAX_ASSIGN_DISTANCE`
+用例失败**，说明 `assignNearest` 的归组结果与预期不符 —— 检查 `MAX_ASSIGN_DISTANCE`
 是否覆盖了测试数据的距离，不要靠改测试来迁就实现。
 
 > **修订（执行后补测）**：上面 10 条里最后一条是补充的 —— `buildCandidates` 第 4 段
@@ -1827,7 +1827,7 @@ export async function recognizeMulti(
 同时在文件顶部的 import 里补上：
 
 ```ts
-import { assignByNearestY, boxCenterY, normalizeBox, type Box4 } from './deviceBoxes'
+import { assignNearest, boxCenterY, normalizeBox, type Box4 } from './deviceBoxes'
 ```
 
 **注意 `scanBarcodes` 必须用动态 import**（`const { scanBarcodes } = await import('./recognize')`），
