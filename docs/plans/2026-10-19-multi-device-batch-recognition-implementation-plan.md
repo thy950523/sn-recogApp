@@ -569,7 +569,7 @@ git commit -m "feat(image): IndexedDB 图片仓库，压缩存储与 Object URL 
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { collectImageIds, orphanedImageIds } from './store'
+import { collectImageIds, droppedImageIds } from './store'
 import type { SnRecord } from '@/types'
 
 const rec = (id: string, imageId?: string): SnRecord => ({
@@ -597,30 +597,29 @@ describe('collectImageIds', () => {
   })
 })
 
-describe('orphanedImageIds', () => {
-  it('图片被剩余记录共用时不得删除', () => {
-    // 一图三码：三条记录共用同一张照片
-    const records = [rec('1', 'img-shared'), rec('2', 'img-shared'), rec('3', 'img-shared')]
-    expect(orphanedImageIds(records, ['1'])).toEqual([])
+describe('droppedImageIds', () => {
+  it('图片仍被剩余记录引用时不得删除', () => {
+    // 一图三码：三条记录共用同一张照片，删掉其中一条后该图仍在用
+    expect(droppedImageIds(['img-shared', 'img-shared', 'img-shared'], ['img-shared', 'img-shared']))
+      .toEqual([])
   })
 
-  it('图片只被被删记录引用时才删除', () => {
-    const records = [rec('1', 'img-a'), rec('2', 'img-b')]
-    expect(orphanedImageIds(records, ['1'])).toEqual(['img-a'])
+  it('不再被任何记录引用时才删除', () => {
+    expect(droppedImageIds(['img-a', 'img-b'], ['img-b'])).toEqual(['img-a'])
   })
 
-  it('混合场景：共用的保留，独占的删除', () => {
-    const records = [rec('1', 'img-shared'), rec('2', 'img-own'), rec('3', 'img-shared')]
-    expect(orphanedImageIds(records, ['1', '2'])).toEqual(['img-own'])
+  it('全部不再被引用时按首次出现顺序返回', () => {
+    expect(droppedImageIds(['img-a', 'img-b'], [])).toEqual(['img-a', 'img-b'])
   })
 
   it('重复引用同一图片时结果去重', () => {
-    const records = [rec('1', 'img-a'), rec('2', 'img-a')]
-    expect(orphanedImageIds(records, ['1', '2'])).toEqual(['img-a'])
+    expect(droppedImageIds(['img-a', 'img-a'], [])).toEqual(['img-a'])
   })
 
-  it('无图记录返回空数组', () => {
-    expect(orphanedImageIds([rec('1')], ['1'])).toEqual([])
+  it('集合无变化或只有新增时返回空数组', () => {
+    expect(droppedImageIds(['img-a'], ['img-a'])).toEqual([])
+    expect(droppedImageIds(['img-a'], ['img-a', 'img-b'])).toEqual([])
+    expect(droppedImageIds([], ['img-a'])).toEqual([])
   })
 })
 ```
@@ -672,64 +671,61 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
 > **修订（Task 4 执行前，重要）**：原规格按「一条记录一张图」写，直接
 > `deleteImages([target.imageId])`。但一图多码场景下**一张照片会挂多条记录**（同一
 > `imageId`）—— 删掉其中一条就会把兄弟记录还在用的照片删掉，缩略图随即失效。
-> 改为按引用计数：只删「这批记录删掉后不再被任何剩余记录引用」的图片。
-> 判断逻辑抽成纯函数 `orphanedImageIds`，可单测。
+
+> **修订（Task 4 质量审查后，最终形态）**：先改成「按引用计数」的
+> `orphanedImageIds(records, removedIds)`，但审查指出它仍依赖删除入口闭包里的
+> `records` 快照 —— 同一 tick 连续两次 `remove` 时快照过期，共用图片会被判为
+> 「仍被引用」而漏删（孤儿 Blob）。最终改为**声明式**：三个删除入口只做 state 更新，
+> 删图交给一个 effect 比对「上一次渲染引用的图片集合」与「本次」的差集。
+> 两者语义等价（`prev \ current` 恰好是被删记录独占的图片），但对连续删除天然免疫。
+> 判断逻辑仍是纯函数 `droppedImageIds`，可单测。
 
 ```ts
-/**
- * 计算删除这批记录后，哪些图片不再被任何剩余记录引用（可安全删除）。
- *
- * 一图多码场景下一张照片会挂多条记录（同一 imageId），
- * 只删其中一条时不能把兄弟记录还在用的图删掉。
- */
-export function orphanedImageIds(
-  records: (SnRecord | ContinuousScanRecord)[],
-  removedIds: string[],
-): string[] {
-  const removed = new Set(removedIds)
-  const stillUsed = new Set(collectImageIds(records.filter((r) => !removed.has(r.id))))
-  const candidates = collectImageIds(records.filter((r) => removed.has(r.id)))
-  return [...new Set(candidates)].filter((id) => !stillUsed.has(id))
+/** 上一次快照中被引用、本次已不再被任何记录引用的图片 id（去重，保持首次出现顺序） */
+export function droppedImageIds(prev: Iterable<string>, current: Iterable<string>): string[] {
+  const cur = new Set(current)
+  return [...new Set(prev)].filter((id) => !cur.has(id))
 }
 ```
 
 ```ts
-  const remove = useCallback(
-    (id: string) => {
-      const imageIds = orphanedImageIds(records, [id])
-      setRecords((prev) => prev.filter((r) => r.id !== id))
-      if (imageIds.length) {
-        void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
-      }
-    },
-    [records],
-  )
+  const remove = useCallback((id: string) => {
+    setRecords((prev) => prev.filter((r) => r.id !== id))
+  }, [])
 
-  const removeMany = useCallback(
-    (ids: string[]) => {
-      const imageIds = orphanedImageIds(records, ids)
-      const set = new Set(ids)
-      setRecords((prev) => prev.filter((r) => !set.has(r.id)))
-      if (imageIds.length) {
-        void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
-      }
-    },
-    [records],
-  )
+  const removeMany = useCallback((ids: string[]) => {
+    if (!ids.length) return
+    const set = new Set(ids)
+    setRecords((prev) => prev.filter((r) => !set.has(r.id)))
+  }, [])
 ```
 
-把 `clear` 改为联动删图（全删时剩余记录为空集，所有图都可删，但仍需去重）：
+删图 effect（放在 `useState` 之后）：
 
 ```ts
-  const clear = useCallback(() => {
-    const imageIds = collectImageIds(records)
-    setRecords([])
-    if (imageIds.length) {
-      void deleteImages([...new Set(imageIds)]).catch((e) =>
-        console.warn('[image] 删除图片失败:', e),
-      )
+  // 声明式删图：只看「上一次渲染引用的图片集合」与「本次」的差集。
+  // 不能用删除入口的闭包快照 —— 同一 tick 连续删除时快照过期，会漏删共用图片。
+  const prevImageIds = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    const current = new Set(collectImageIds(records))
+    const prev = prevImageIds.current
+    prevImageIds.current = current
+    if (!prev) return // 首次挂载不删（此时没有「上一次」可比）
+    const dropped = droppedImageIds(prev, current)
+    if (dropped.length) {
+      void deleteImages(dropped).catch((e) => console.warn('[image] 删除图片失败:', e))
     }
   }, [records])
+```
+
+> StrictMode 安全：ref 在同一次组件实例里存活，「挂载→卸载→再挂载」时第二次 effect
+> 的 `prev === current`，不会误删。首次从 localStorage 读到已有记录时 `prev === null`，
+> 直接跳过，不会把已有图片删光。
+
+把 `clear` 也退化为纯 state 更新（全删时 effect 的差集就是全部图片）：
+
+```ts
+  const clear = useCallback(() => setRecords([]), [])
 ```
 
 新增 `addMany`（一次 setState 批量登记，返回新 id）：
@@ -737,6 +733,7 @@ export function orphanedImageIds(
 ```ts
   /** 批量登记：一次 setState 写入多条，返回新建记录的 id 列表 */
   const addMany = useCallback((list: Omit<SnRecord, 'id' | 'time'>[]): string[] => {
+    if (!list.length) return [] // 空批次不触发无意义的重渲染与 localStorage 写
     const now = Date.now()
     const created = list.map((r, i) => ({
       ...r,
@@ -770,7 +767,7 @@ export function orphanedImageIds(
 npx vitest run src/lib/store.test.ts && npx tsc -b
 ```
 
-Expected: `7 passed`（`collectImageIds` 2 条 + `orphanedImageIds` 5 条），类型检查无错误。
+Expected: `7 passed`（`collectImageIds` 2 条 + `droppedImageIds` 5 条），类型检查无错误。
 
 **Step 6: Commit**
 
@@ -2182,7 +2179,7 @@ git commit -m "feat(image): 拍照后压缩存入 IndexedDB，登记记录关联
 > 该行卸载会 revoke 掉其余行仍在渲染的 URL，它们的 `<img>` 立刻变空白，且 `imageId`
 > 未变、effect 不会重跑，不会自愈。
 > 改为：**行级只登记、不释放**；`RecordsView` 卸载时统一释放一次。
-> 被删空的图片本身由 `remove()` → `orphanedImageIds` → `deleteImages` 负责释放。
+> 被删空的图片本身由 `useRecords` 的删图 effect（`droppedImageIds` → `deleteImages`）负责释放。
 
 在 `RecordsView.tsx` 里新增一个内部组件（放在文件底部）：
 

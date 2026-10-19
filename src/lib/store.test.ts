@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { collectImageIds, orphanedImageIds } from './store'
+import { collectImageIds, droppedImageIds } from './store'
 import type { SnRecord } from '@/types'
 
 const rec = (id: string, imageId?: string): SnRecord => ({
@@ -27,29 +27,28 @@ describe('collectImageIds', () => {
   })
 })
 
-describe('orphanedImageIds', () => {
-  it('图片被剩余记录共用时不得删除', () => {
-    // 一图三码：三条记录共用同一张照片
-    const records = [rec('1', 'img-shared'), rec('2', 'img-shared'), rec('3', 'img-shared')]
-    expect(orphanedImageIds(records, ['1'])).toEqual([])
+describe('droppedImageIds', () => {
+  it('图片仍被剩余记录引用时不得删除', () => {
+    // 一图三码：三条记录共用同一张照片，删掉其中一条后该图仍在用
+    expect(droppedImageIds(['img-shared', 'img-shared', 'img-shared'], ['img-shared', 'img-shared']))
+      .toEqual([])
   })
 
-  it('图片只被被删记录引用时才删除', () => {
-    const records = [rec('1', 'img-a'), rec('2', 'img-b')]
-    expect(orphanedImageIds(records, ['1'])).toEqual(['img-a'])
+  it('不再被任何记录引用时才删除', () => {
+    expect(droppedImageIds(['img-a', 'img-b'], ['img-b'])).toEqual(['img-a'])
   })
 
-  it('混合场景：共用的保留，独占的删除', () => {
-    const records = [rec('1', 'img-shared'), rec('2', 'img-own'), rec('3', 'img-shared')]
-    expect(orphanedImageIds(records, ['1', '2'])).toEqual(['img-own'])
+  it('全部不再被引用时按首次出现顺序返回', () => {
+    expect(droppedImageIds(['img-a', 'img-b'], [])).toEqual(['img-a', 'img-b'])
   })
 
   it('重复引用同一图片时结果去重', () => {
-    const records = [rec('1', 'img-a'), rec('2', 'img-a')]
-    expect(orphanedImageIds(records, ['1', '2'])).toEqual(['img-a'])
+    expect(droppedImageIds(['img-a', 'img-a'], [])).toEqual(['img-a'])
   })
 
-  it('无图记录返回空数组', () => {
-    expect(orphanedImageIds([rec('1')], ['1'])).toEqual([])
+  it('集合无变化或只有新增时返回空数组', () => {
+    expect(droppedImageIds(['img-a'], ['img-a'])).toEqual([])
+    expect(droppedImageIds(['img-a'], ['img-a', 'img-b'])).toEqual([])
+    expect(droppedImageIds([], ['img-a'])).toEqual([])
   })
 })

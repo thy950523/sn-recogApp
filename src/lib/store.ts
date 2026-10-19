@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ContinuousScanRecord, SnRecord } from '@/types'
 import { deleteImages } from './imageStore'
 
@@ -20,24 +20,28 @@ export function collectImageIds(records: (SnRecord | ContinuousScanRecord)[]): s
   return records.map((r) => r.imageId).filter((id): id is string => !!id)
 }
 
-/**
- * 计算删除这批记录后，哪些图片不再被任何剩余记录引用（可安全删除）。
- *
- * 一图多码场景下一张照片会挂多条记录（同一 imageId），
- * 只删其中一条时不能把兄弟记录还在用的图删掉。
- */
-export function orphanedImageIds(
-  records: (SnRecord | ContinuousScanRecord)[],
-  removedIds: string[],
-): string[] {
-  const removed = new Set(removedIds)
-  const stillUsed = new Set(collectImageIds(records.filter((r) => !removed.has(r.id))))
-  const candidates = collectImageIds(records.filter((r) => removed.has(r.id)))
-  return [...new Set(candidates)].filter((id) => !stillUsed.has(id))
+/** 上一次快照中被引用、本次已不再被任何记录引用的图片 id（去重，保持首次出现顺序） */
+export function droppedImageIds(prev: Iterable<string>, current: Iterable<string>): string[] {
+  const cur = new Set(current)
+  return [...new Set(prev)].filter((id) => !cur.has(id))
 }
 
 export function useRecords() {
   const [records, setRecords] = useState<(SnRecord | ContinuousScanRecord)[]>(load)
+
+  // 声明式删图：只看「上一次渲染引用的图片集合」与「本次」的差集。
+  // 不能用删除入口的闭包快照 —— 同一 tick 连续删除时快照过期，会漏删共用图片。
+  const prevImageIds = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    const current = new Set(collectImageIds(records))
+    const prev = prevImageIds.current
+    prevImageIds.current = current
+    if (!prev) return // 首次挂载不删（此时没有「上一次」可比）
+    const dropped = droppedImageIds(prev, current)
+    if (dropped.length) {
+      void deleteImages(dropped).catch((e) => console.warn('[image] 删除图片失败:', e))
+    }
+  }, [records])
 
   useEffect(() => {
     try {
@@ -56,6 +60,7 @@ export function useRecords() {
 
   /** 批量登记：一次 setState 写入多条，返回新建记录的 id 列表 */
   const addMany = useCallback((list: Omit<SnRecord, 'id' | 'time'>[]): string[] => {
+    if (!list.length) return []
     const now = Date.now()
     const created = list.map((r, i) => ({
       ...r,
@@ -66,38 +71,17 @@ export function useRecords() {
     return created.map((r) => r.id)
   }, [])
 
-  const remove = useCallback(
-    (id: string) => {
-      const imageIds = orphanedImageIds(records, [id])
-      setRecords((prev) => prev.filter((r) => r.id !== id))
-      if (imageIds.length) {
-        void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
-      }
-    },
-    [records],
-  )
+  const remove = useCallback((id: string) => {
+    setRecords((prev) => prev.filter((r) => r.id !== id))
+  }, [])
 
-  const removeMany = useCallback(
-    (ids: string[]) => {
-      const imageIds = orphanedImageIds(records, ids)
-      const set = new Set(ids)
-      setRecords((prev) => prev.filter((r) => !set.has(r.id)))
-      if (imageIds.length) {
-        void deleteImages(imageIds).catch((e) => console.warn('[image] 删除图片失败:', e))
-      }
-    },
-    [records],
-  )
+  const removeMany = useCallback((ids: string[]) => {
+    if (!ids.length) return
+    const set = new Set(ids)
+    setRecords((prev) => prev.filter((r) => !set.has(r.id)))
+  }, [])
 
-  const clear = useCallback(() => {
-    const imageIds = collectImageIds(records) // 全删，剩余记录为空集
-    setRecords([])
-    if (imageIds.length) {
-      void deleteImages([...new Set(imageIds)]).catch((e) =>
-        console.warn('[image] 删除图片失败:', e),
-      )
-    }
-  }, [records])
+  const clear = useCallback(() => setRecords([]), [])
 
   const addContinuousRecord = useCallback(
     (r: Omit<ContinuousScanRecord, 'id' | 'time'>) => {
