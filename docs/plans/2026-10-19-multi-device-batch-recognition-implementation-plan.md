@@ -30,7 +30,7 @@
 `src/lib/recognize.ts` 存在一个既有 bug：`recognizeSn()` 内的 `runOcr` 闭包引用了
 嵌套 `if` 块中声明的 `worker`，闭包作用域链上不可见 —— 运行时抛 `ReferenceError`，
 且被四处空 `catch` 静默吞掉，导致**服务端 OCR 不可用时的本地 Tesseract 兜底完全失效**。
-它同时让 `npx tsc -b` 报 3 个错、`npm run build` 跑不过。
+它同时让 `npx tsc -b` 报 3 个错、`pnpm run build` 跑不过。
 
 已修复（commit `ed4194b`）：`worker` 改为 `runOcr` 的形参传入，四处空 catch 改为打日志。
 控制流与 fallback 顺序未动。**Task 7 的降级路径依赖这个修复**。
@@ -109,7 +109,7 @@ describe('测试基建', () => {
 **Step 5: 运行测试确认通过**
 
 ```bash
-npm test
+pnpm test
 ```
 
 Expected: `1 passed`，退出码 0。
@@ -2332,7 +2332,11 @@ Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表
             return (
 ```
 
-（把原来的 `))}` 对应改成 `})}`；`d` 不再来自 `devices` 而来自 `row.source`。）
+（`d` 不再来自 `devices` 而来自 `row.source`。）
+
+> **勘误（Task 9 执行后）**：原文还写着「把原来的 `))}` 对应改成 `})}`」——这条是无效指令。
+> Task 8 那段本来就是**块体**箭头函数（`=> {` … `})}`），不是括号体，闭合行不用动。
+> 实现者只需在块体开头加 `const d = row.source` 与 `return (`。
 
 > **角标不用在本步改。** Task 8 已经把它从「向上翻转」改成「画在框内左上角」了
 > （原因见 Task 8：翻转会压住页头，而用「y0 小于某阈值才翻转」兜不住 —— 阈值是归一化量，
@@ -2374,8 +2378,16 @@ const [activeIndex, setActiveIndex] = useState<number | null>(null)
   // existingSns 每次父组件渲染都可能是新数组。若直接放进初始化 effect 的依赖，
   // 父组件任何一次重渲染都会把用户的勾选、编辑、删行全部重置。
   // 用 ref 取最新值，只在 result 变化时初始化一次。
+  //
+  // 赋值必须放进一个「声明在初始化 effect 之前、且无依赖」的 effect，
+  // **不要**在渲染期直接写 `existingRef.current = existingSns`。
+  // 勘误（Task 9 执行后）：本仓库启用了 react-hooks 的 refs 规则，渲染期写 ref 会报
+  // 「Cannot access refs during render」，计划原文的写法会让 lint 多一个错误。
+  // 同一次 commit 内 effect 按声明顺序执行，所以初始化 effect 读到的仍是本次渲染的值。
   const existingRef = useRef(existingSns)
-  existingRef.current = existingSns
+  useEffect(() => {
+    existingRef.current = existingSns
+  })
 
   useEffect(() => {
     if (!result) return
@@ -2537,10 +2549,19 @@ const [activeIndex, setActiveIndex] = useState<number | null>(null)
 **Step 4: 类型检查与 lint**
 
 ```bash
-npx tsc -b && npm run lint
+npx tsc -b && pnpm run lint
 ```
 
-Expected: 无错误。
+Expected: `tsc` 无输出（退出码 0）。
+
+`lint` **退出码不是 0，这是正常的** —— 仓库基线本来就有 16 个 error，全在无关文件里
+（`components/ui/badge|button|carousel|form|navigation-menu|sidebar|toggle`、
+`hooks/use-mobile.ts`、`lib/deviceFields.ts`、`sections/ResultView.tsx`；
+最后这个会在 Task 10 删除）。
+
+判据是**不要比基线多**：改完仍应是 `✖ 16 problems`，且
+`npx eslint src/sections/MultiResultView.tsx` 单独跑退出码 0。
+Task 9 实测：基线 16 → 改后 16，本文件单独跑干净。
 
 **Step 5: Commit**
 
@@ -2683,7 +2704,7 @@ Expected: 输出「无残留引用」。
 **Step 4: 类型检查与构建**
 
 ```bash
-npx tsc -b && npm run build
+npx tsc -b && pnpm run build
 ```
 
 Expected: 构建成功。
@@ -2691,7 +2712,7 @@ Expected: 构建成功。
 **Step 5: 手工冒烟**
 
 ```bash
-npm run dev
+pnpm run dev
 ```
 
 手机/浏览器打开 → 拍照 → 应进入「批量识别」页，原图上出现标注框，下方是候选列表。
@@ -2740,6 +2761,16 @@ export default function Home() {
    * 再点一次会抓到最后那一帧的副本）。第二次点击会再存一张图，而它对应的 screen
    * 会被后一次 setScreen 覆盖 —— 那张图的 imageId 永远不会被任何记录引用，
    * 成为只占空间、只能靠「清空全部」才能回收的孤儿图。
+   *
+   * **锁的释放点同样关键：必须放回 false，否则相机就废了。**
+   * Home 组件在切屏时**不会卸载**（它只是换了 return 的 JSX），所以 savingRef 会
+   * 一直活着。若只置 true 不置回 false，第一张照片之后 savingRef 永远是 true，
+   * 之后每次按快门都在 `if (savingRef.current) return` 上静默返回 ——
+   * 按钮看着能按、点了没反应、也不报错，正是本项目最忌讳的那种失败。
+   *
+   * 释放点选在「离开识别页」而不是「存图结束」：存图结束到 React 真正重渲染之间
+   * 还有一帧的窗口，此时旧 DOM 上的快门仍可点，锁一松就又能存出孤儿图。
+   * 把锁持有到离开识别页为止，这个窗口就完全不存在了。
    */
   const savingRef = useRef(false)
   const handleShot = useCallback(async (image: ImagePayload) => {
@@ -2756,7 +2787,12 @@ export default function Home() {
         img.onerror = () => reject(new Error('图片解码失败'))
         img.src = image.dataUrl
       })
-      canvas.getContext('2d')!.drawImage(img, 0, 0)
+      // 显式给出目标宽高，不要写成 drawImage(img, 0, 0)。
+      // 眼下两者恰好相等（dataUrl 正是从 image.width×image.height 的画布导出的，
+      // 解码回来还是同样大小），所以 drawImage(img,0,0) 现在是 1:1 拷贝、看不出问题。
+      // 但一旦哪天载荷改成传原图 dataUrl，drawImage(img,0,0) 会按**原图**尺寸绘制、
+      // 超出画布的部分被静默裁掉 —— 存下来的是照片左上角一块，且不报错。
+      canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height)
       imageId = await saveCanvasImage(canvas)
     } catch (e) {
       console.warn('[image] 保存失败，本次登记将不带图片:', e)
@@ -2764,6 +2800,29 @@ export default function Home() {
     setScreen({ name: 'multi', image, key: Date.now(), imageId })
   }, [])
 ```
+
+**Step 1b: 释放 savingRef 锁（两条回扫屏的路径都要加）**
+
+这两处是识别页唯一的出口，锁在这里释放。漏掉任何一条，那条路径之后相机就再也不出图了：
+
+```tsx
+  const handleRegister = useCallback(
+    (list: Omit<SnRecord, 'id' | 'time'>[]) => {
+      addMany(list)
+      savingRef.current = false
+      setScreen({ name: 'scan' })
+    },
+    [addMany],
+  )
+
+  const handleRetake = useCallback(() => {
+    savingRef.current = false
+    setScreen({ name: 'scan' })
+  }, [])
+```
+
+> 自检方法：连拍两张。拍完第一张 → 重拍 → 再拍第二张。若第二张按快门没反应，
+> 就是锁没释放。这一步**必须手工验证**，因为它不会让任何测试或类型检查变红。
 
 并把渲染分支改为：
 
@@ -2793,7 +2852,7 @@ Expected: 无错误。
 **Step 3: 手工验证**
 
 ```bash
-npm run dev
+pnpm run dev
 ```
 
 拍照 → 登记 2 条 → 浏览器 DevTools → Application → IndexedDB → `sn-scanner-images` → `images`
@@ -3374,7 +3433,7 @@ import { exportExcel } from '@/lib/exportExcel'
 **Step 8: 端到端验证**
 
 ```bash
-npm run dev
+pnpm run dev
 ```
 
 1. 拍一张有 2～3 台设备的照片 → 登记 2 条
@@ -3387,7 +3446,7 @@ npm run dev
 **Step 9: 类型检查、lint、构建**
 
 ```bash
-npx tsc -b && npm run lint && npm run build
+npx tsc -b && pnpm run lint && pnpm run build
 ```
 
 Expected: 全部通过。
