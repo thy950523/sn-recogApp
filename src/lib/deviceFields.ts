@@ -154,13 +154,29 @@ export function extractDeviceFields(rawText: string, barcodes: string[]): Device
     addImei(m[2], slotOf(m[1]))
   }
 
-  // 排序：IMEI1（槽位 1）在前、IMEI2（槽位 2）在后、无槽位按出现顺序
-  imeis.sort((a, b) => {
+  // 排序：IMEI1（槽位 1）在前、IMEI2（槽位 2）在后。
+  // 未标槽位（slot=null）的 IMEI 必须按出现顺序补进空闲槽位，而不能直接排在已知槽位之后：
+  // 机身常见的「IMEI: xxx」+「IMEI2: yyy」排版里，第一行标签没印槽位数字，slot 为 null。
+  // 若让 null 排在槽位 2 之后，multiRecognize 按下标取 imei/imei2 时会把物理标签为 IMEI2 的
+  // 值填进 imei 字段、反之亦然 —— 两个字段的标签整体写反，且多码确认页里这两格是只读文本，
+  // 用户无法手工修正。补号后「未标槽位」自然落进槽位 1，与物理标签一致。
+  // 槽位号只有 1、2 两个（对应 IMEI1/IMEI2）；两个都被占用时（如三个 IMEI）保持 null 排最后。
+  const usedSlots = new Set<number>()
+  for (const f of imeis) if (f.slot !== null) usedSlots.add(f.slot)
+  const ranked = imeis.map((f) => {
+    if (f.slot !== null) return f
+    let free = 1
+    while (usedSlots.has(free)) free++
+    if (free > 2) return f // 1、2 已占满，无空闲槽位可补
+    usedSlots.add(free)
+    return { ...f, slot: free } // 不改传入对象
+  })
+  ranked.sort((a, b) => {
     const rank = (s: number | null) => (s === 1 ? 0 : s === 2 ? 1 : 2)
     return rank(a.slot) - rank(b.slot)
   })
 
-  return { sn, imeis, meid, eid }
+  return { sn, imeis: ranked, meid, eid }
 }
 
 /** 带 EID/IMEI 等标签前缀的行——那些行印的本来就不是 SN */
