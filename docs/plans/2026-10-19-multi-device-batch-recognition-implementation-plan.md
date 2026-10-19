@@ -3507,7 +3507,11 @@ pnpm run dev
 npx tsc -b && pnpm run lint && pnpm run build
 ```
 
-Expected: 全部通过。
+Expected: `tsc` 与 `build` 通过；`lint` **退出码不是 0，这是正常的** ——
+仓库基线本来就有 16 个无关 error，Task 10 删掉 `src/sections/ResultView.tsx`（占其中 1 个）
+之后应降到 **15**。判据是「等于 15」，不是「0」。
+另外单独跑 `npx eslint src/lib/exportExcel.ts src/lib/exportExcel.test.ts src/lib/export.ts src/sections/RecordsView.tsx`，
+期望退出码 0。
 
 **Step 10: Commit**
 
@@ -3528,10 +3532,11 @@ git commit -m "feat(export): Excel 导出，记录行嵌缩略图 + 原图页"
 npx vitest run
 ```
 
-Expected: 全部通过，**70 passed**（smoke 1 + imageStore 18 + store 7 + deviceBoxes 15 + multiRecognize 23 + exportExcel 6）。
+Expected: 全部通过，**100 passed**（smoke 1 + imageStore 18 + store 7 + deviceBoxes 15 + multiRecognize 23 + registerRows 30 + exportExcel 6）。
 
-> 勘误：原文写 68、且把 multiRecognize 记作 21。Task 7 修缺陷时补了 2 个用例，
-> 实际是 23；Task 9 之后实测总数 64，加上 exportExcel 的 6 个即 70。
+> 勘误：这个数字改过两次。原文写 68、把 multiRecognize 记作 21（Task 7 补测后实际是 23）；
+> Task 9 又把登记映射抽成纯函数并补了 30 条（`registerRows.test.ts`），
+> 所以基线是 94，加上 exportExcel 的 6 个即 100。
 > 这条数字会随每次补测漂移，**以实际输出为准**，本条只是让你能判断「多出来的是不是我加的」。
 
 **Step 2: 逐条对照设计文档的验收标准**
