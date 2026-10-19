@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { recognizeMulti, type MultiRecognizeResult } from '@/lib/multiRecognize'
 import { normalizeSn } from '@/lib/deviceFields'
-import { rowsToRecords, type CandidateRow } from '@/lib/registerRows'
+import { rowsToRecords, hasSn, isDuplicateSn, type CandidateRow } from '@/lib/registerRows'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
 
@@ -158,9 +158,11 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
     if (!result) return
     setRows(
       result.devices.map((d) => {
-        // 与 isDuplicate 用同一套归一化比较，否则会出现「红标说重复、勾选框却默认勾上」
-        // 的自相矛盾：d.sn 侧本来就是纯字母数字，要归一化的是记录侧那个自由文本。
-        const dup = existingRef.current.some((s) => normalizeSn(s) === d.sn)
+        // 与红标（isDuplicate）共用同一个归一化判据，否则会出现「红标说重复、
+        // 勾选框却默认勾上」的自相矛盾。isDuplicateSn 两侧都归一化，所以这里
+        // 不再依赖「d.sn 恒已归一化」这个不变量 —— 将来多一条候选产出路径忘了
+        // 归一化，这个默认勾选闸门也不会静默失效。
+        const dup = isDuplicateSn(d.sn, existingRef.current)
         return {
           sn: d.sn,
           // 默认勾选；与已有记录重复的默认不勾，避免误登记
@@ -171,9 +173,9 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
     )
   }, [result])
 
-  // 判据必须与 rowsToRecords 的过滤一致（都是「勾选且归一化后非空」），
+  // 判据必须与 rowsToRecords 的过滤一致（都走 hasSn：「勾选且归一化后非空」），
   // 否则按钮说「登记 N 条」、实际却存了 M 条，是静默不一致。
-  const checkedCount = rows.filter((r) => r.checked && normalizeSn(r.sn) !== '').length
+  const checkedCount = rows.filter((r) => r.checked && hasSn(r.sn)).length
 
   const toggle = (i: number) =>
     setRows((prev) => prev.map((r, j) => (j === i ? { ...r, checked: !r.checked } : r)))
@@ -192,29 +194,15 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
   /**
    * 重复行：与已有记录或其他候选行 SN 相同。
    *
-   * **必须按归一化后的值比较**：OCR 侧 DeviceCandidate.sn 永远是纯字母数字
-   * （snFromLine 走 extractSnByMarker 的 [A-Z0-9]{6,20} 或 extractSnCandidates
-   * 的 [^A-Z0-9]+ 切词；条码分支的 b.value 也经 toHit→normalizeSn），
-   * 而记录侧 SnRecord.sn 是**用户可编辑的自由文本**（editSn 只做 toUpperCase、
-   * 不剥分隔符），store.addMany 也只是 {...r} 原样存。
-   * 于是用户把某条改成 "AB-12-34" 登记后，再拍同一台设备（OCR 出 "AB1234"），
-   * 用原始值 includes('AB1234') 会漏判 —— 该行既不显示 ⛔ 重复、又被默认勾选，
-   * 用户一按登记就把重复设备存了，全程无提示（本项目最忌的静默出错）。
-   *
-   * 两处判据必须一起改：这里（红标）与初始化 effect 的默认勾选闸门。
-   * 只改一处就会出现「红标说重复、勾选框却默认勾上」的自相矛盾。
+   * 判据本体（为什么必须按归一化后的值比较、为什么两侧都要归一化、
+   * 为什么归一化后为空的行不算重复）在 registerRows.isDuplicateSn，
+   * 那里是纯函数、有测试覆盖。这里只负责把「其它行」拼出来。
    */
-  const isDuplicate = (sn: string, i: number) => {
-    const n = normalizeSn(sn)
-    // 归一化后为空的行不参与判重。用户把两行都清空（或只留标点）时它们会互相「相同」，
-    // 于是两行各挂一个 ⛔ 重复 —— 但空行本就不参与登记（过滤与 checkedCount 都用
-    // `normalizeSn(r.sn) !== ''`），标它重复是在说一件不存在的事。
-    if (!n) return false
-    return (
-      existingSns.some((s) => normalizeSn(s) === n) ||
-      rows.some((r, j) => j !== i && normalizeSn(r.sn) === n)
-    )
-  }
+  const isDuplicate = (sn: string, i: number) =>
+    isDuplicateSn(sn, [
+      ...existingSns,
+      ...rows.filter((_, j) => j !== i).map((r) => r.sn),
+    ])
 
   const register = () => {
     const list = rowsToRecords(rows, imageId)
@@ -377,7 +365,12 @@ export default function MultiResultView({ image, existingSns, onRetake, onRegist
                     ⛔ 重复
                   </span>
                 )}
-                {d.barcode && d.barcode !== row.sn && (
+                {/* 必须按归一化值比较：d.barcode 是归一化值（条码经 recognize.ts 的
+                    toHit→normalizeSn），而 row.sn 是用户可编辑的自由文本。用原始值比
+                    时，用户把 SN 改成 "AB-12-34" 会显示一条本不存在的「条码 AB1234」提示，
+                    可这条记录实际会以 source='barcode'、verified=true 入库（见 rowsToRecords）
+                    —— 界面与落库结果自相矛盾。理由与 isDuplicateSn 完全相同。 */}
+                {d.barcode && d.barcode !== normalizeSn(row.sn) && (
                   <span className="font-mono text-[10px] text-[#777]">条码 {d.barcode}</span>
                 )}
                 {d.imei && <span className="font-mono text-[10px] text-[#777]">IMEI {d.imei}</span>}

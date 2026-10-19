@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { rowsToRecords, type CandidateRow } from './registerRows'
+import { rowsToRecords, hasSn, isDuplicateSn, type CandidateRow } from './registerRows'
 import type { DeviceCandidate } from './multiRecognize'
 
 /** 造一个字段齐全的 DeviceCandidate fixture，默认值取「无条码、仅 OCR」 */
@@ -25,6 +25,50 @@ function candidate(over: Partial<DeviceCandidate> = {}): DeviceCandidate {
 function row(over: Partial<CandidateRow> = {}): CandidateRow {
   return { sn: 'AB1234', checked: true, source: candidate(), ...over }
 }
+
+describe('hasSn', () => {
+  it('纯字母数字 → true', () => {
+    expect(hasSn('AB1234')).toBe(true)
+  })
+
+  it('带分隔符但含字母数字（ab-12-34）→ true', () => {
+    expect(hasSn('ab-12-34')).toBe(true)
+  })
+
+  it('只由标点组成（---，归一化后为空串）→ false', () => {
+    expect(hasSn('---')).toBe(false)
+  })
+
+  it('空串 → false', () => {
+    expect(hasSn('')).toBe(false)
+  })
+
+  it('纯空格 → false', () => {
+    expect(hasSn('  ')).toBe(false)
+  })
+})
+
+describe('isDuplicateSn', () => {
+  it('与 others 中某项归一化后相同（ab-12-34 vs AB1234）→ true', () => {
+    expect(isDuplicateSn('ab-12-34', ['AB1234'])).toBe(true)
+  })
+
+  it('都不相同 → false', () => {
+    expect(isDuplicateSn('AB1234', ['CC9999', 'DD8888'])).toBe(false)
+  })
+
+  it('others 为空数组 → false', () => {
+    expect(isDuplicateSn('AB1234', [])).toBe(false)
+  })
+
+  it('大小写不同但归一化相同 → true', () => {
+    expect(isDuplicateSn('ab1234', ['AB1234'])).toBe(true)
+  })
+
+  it('sn 归一化后为空（---）且 others 里也有一项归一化后为空 → 仍返回 false', () => {
+    expect(isDuplicateSn('---', ['---'])).toBe(false)
+  })
+})
 
 describe('rowsToRecords 过滤', () => {
   it('未勾选的行被过滤掉', () => {
@@ -118,6 +162,63 @@ describe('rowsToRecords 字段映射', () => {
     expect(out[0].sn).toBe('AB1234')
     expect(out[0].source).toBe('barcode')
     expect(out[0].verified).toBe(true)
+  })
+
+  it('status=barcode_only（有条码、SN 也等于条码）→ source=barcode 但 verified=false、ocr=null', () => {
+    // 语义反直觉、值得锁住：status 不是 'match' 说明这次配对**没经双验证**
+    // （例如只读到了条码），所以即便 barcode 与 sn 相等也不能标 verified。
+    const out = rowsToRecords(
+      [
+        row({
+          sn: 'AB1234',
+          source: candidate({
+            sn: 'AB1234',
+            barcode: 'AB1234',
+            barcodes: ['AB1234'],
+            status: 'barcode_only',
+          }),
+        }),
+      ],
+      null,
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0].source).toBe('barcode')
+    expect(out[0].verified).toBe(false)
+    expect(out[0].ocr).toBeNull()
+  })
+
+  it('status=ocr_only 的行：ocr 字段等于 SN', () => {
+    const out = rowsToRecords(
+      [row({ sn: 'AB1234', source: candidate({ sn: 'AB1234', status: 'ocr_only' }) })],
+      null,
+    )
+    expect(out[0].ocr).toBe('AB1234')
+  })
+
+  it('barcodes 数组与 imei / imei2 / meid / eid 原样透传', () => {
+    const out = rowsToRecords(
+      [
+        row({
+          sn: 'AB1234',
+          source: candidate({
+            sn: 'AB1234',
+            barcode: 'AB1234',
+            barcodes: ['AB1234', 'AB1234-2'],
+            imei: '111111111111111',
+            imei2: '222222222222222',
+            meid: '33333333333333',
+            eid: '4444444444444444',
+            status: 'match',
+          }),
+        }),
+      ],
+      null,
+    )
+    expect(out[0].barcodes).toEqual(['AB1234', 'AB1234-2'])
+    expect(out[0].imei).toBe('111111111111111')
+    expect(out[0].imei2).toBe('222222222222222')
+    expect(out[0].meid).toBe('33333333333333')
+    expect(out[0].eid).toBe('4444444444444444')
   })
 
   it('imageId 传 null 时，记录里是 undefined 而不是 null', () => {

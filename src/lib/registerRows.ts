@@ -18,19 +18,53 @@ export interface CandidateRow {
 }
 
 /**
+ * 「这一行有可登记的 SN」—— 归一化后非空。
+ *
+ * 过滤、按钮计数、判重三处必须共用这一个判据。任何一处退回 `sn.trim()`
+ * 都会放过 "---" 这类归一化后为空的行：trim 判它是真值，归一化却得空串，
+ * 于是写进一条 sn 为空的垃圾记录。
+ */
+export const hasSn = (sn: string): boolean => normalizeSn(sn) !== ''
+
+/**
+ * sn 是否与 others 中的某个重复（两侧都按归一化比较）。
+ *
+ * **必须按归一化后的值比较**：OCR 侧 DeviceCandidate.sn 永远是纯字母数字
+ * （snFromLine 走 extractSnByMarker 的 [A-Z0-9]{6,20} 或 extractSnCandidates
+ * 的 [^A-Z0-9]+ 切词；条码分支的 b.value 也经 toHit→normalizeSn），
+ * 而记录侧 SnRecord.sn 是**用户可编辑的自由文本**（editSn 只做 toUpperCase、
+ * 不剥分隔符），store.addMany 也只是 {...r} 原样存。
+ * 于是用户把某条改成 "AB-12-34" 登记后，再拍同一台设备（OCR 出 "AB1234"），
+ * 用原始值 includes('AB1234') 会漏判 —— 该行既不显示 ⛔ 重复、又被默认勾选，
+ * 用户一按登记就把重复设备存了，全程无提示（本项目最忌的静默出错）。
+ *
+ * 两侧都归一化，于是不依赖「传入的 sn 恒已归一化」这个不变量：将来多一条候选
+ * 产出路径忘了归一化，判重也不会静默失效。
+ *
+ * 归一化后为空的一律不算重复：空行本就不参与登记（见 hasSn），
+ * 两行都清空时它们会互相「相同」，各挂一个 ⛔ 重复 —— 那是在说一件不存在的事。
+ */
+export function isDuplicateSn(sn: string, others: readonly string[]): boolean {
+  const n = normalizeSn(sn)
+  if (!n) return false
+  return others.some((s) => normalizeSn(s) === n)
+}
+
+/**
  * 只取勾选且归一化后非空的行。返回的顺序与传入一致。
  * imageId 为 null（存图失败）时写 undefined，而不是 null。
  *
- * 过滤判据用 normalizeSn(r.sn) 而不是 r.sn.trim()：归一化会把「只由非字母数字
- * 组成的输入」变成空串（如用户误输入 "---"）。用 trim() 判定的话 "---" 是真值、
- * 会通过过滤，最终写进一条 sn 为空的垃圾记录，并出现在列表 / CSV / Excel 里。
+ * 过滤判据走 hasSn（= normalizeSn(r.sn) !== ''）而不是 r.sn.trim()：归一化会把
+ * 「只由非字母数字组成的输入」变成空串（如用户误输入 "---"）。用 trim() 判定的
+ * 话 "---" 是真值、会通过过滤，最终写进一条 sn 为空的垃圾记录，并出现在
+ * 列表 / CSV / Excel 里。
  */
 export function rowsToRecords(
   rows: CandidateRow[],
   imageId: string | null,
 ): Omit<SnRecord, 'id' | 'time'>[] {
   return rows
-    .filter((r) => r.checked && normalizeSn(r.sn) !== '')
+    .filter((r) => r.checked && hasSn(r.sn))
     .map((r) => {
       // 存储与比对都用归一化形式：条码值经 toHit→normalizeSn 已是纯字母数字，
       // 用户手打的 SN 却可能带分隔符。不归一化的话，一个「其实与条码一致」的
