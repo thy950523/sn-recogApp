@@ -511,6 +511,7 @@ export async function recognizeSn(
 
   // ---- 2. OCR：优先服务端，失败则本地 Tesseract ----
   const runOcr = async (
+    worker: Worker,
     img: HTMLCanvasElement,
     psm: PSM,
     withLines = false,
@@ -560,16 +561,18 @@ export async function recognizeSn(
         const strip = extractTextStrip(canvas, b)
         if (strip) {
           try {
-            const { text } = await runOcr(strip, PSM.SINGLE_LINE)
+            const { text } = await runOcr(worker, strip, PSM.SINGLE_LINE)
             ocrTexts.push(text)
             const sn = findSn(text)
             if (sn) { ocr = sn; break }
-          } catch { /* ignore */ }
+          } catch (err) {
+            console.warn('[OCR 本地] 识别失败:', err)
+          }
         }
         // 2b-ii. 兜底：宽区域裁剪 + 逐行找标记
         const crop = cropBelowBarcode(canvas, b.box)
         try {
-          const { text, lines } = await runOcr(crop, PSM.SINGLE_BLOCK, true)
+          const { text, lines } = await runOcr(worker, crop, PSM.SINGLE_BLOCK, true)
           ocrTexts.push(text)
           let sn: string | null = null
           for (const ln of lines) {
@@ -578,7 +581,9 @@ export async function recognizeSn(
           }
           if (!sn) sn = findSn(text)
           if (sn) { ocr = sn; break }
-        } catch { /* ignore */ }
+        } catch (err) {
+          console.warn('[OCR 本地] 识别失败:', err)
+        }
       }
     }
 
@@ -586,22 +591,26 @@ export async function recognizeSn(
     if (!ocr) {
       onStage?.('OCR 全图识别…')
       try {
-        const { text } = await runOcr(canvas, PSM.SPARSE_TEXT)
+        const { text } = await runOcr(worker, canvas, PSM.SPARSE_TEXT)
         ocrTexts.push(text)
         ocr = findSn(text)
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.warn('[OCR 本地] 识别失败:', err)
+      }
     }
     if (!ocr) {
       onStage?.('OCR 二次识别…')
       try {
-        const { text, lines } = await runOcr(canvas, PSM.SINGLE_BLOCK, true)
+        const { text, lines } = await runOcr(worker, canvas, PSM.SINGLE_BLOCK, true)
         ocrTexts.push(text)
         for (const ln of lines) {
           ocr = findSn(ln)
           if (ocr) break
         }
         if (!ocr) ocr = findSn(text)
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.warn('[OCR 本地] 识别失败:', err)
+      }
     }
   }
 
