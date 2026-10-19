@@ -509,7 +509,7 @@ export async function saveCanvasImage(
 npx vitest run src/lib/imageStore.test.ts
 ```
 
-Expected: `8 passed`。
+Expected: `18 passed`。
 
 > **修订（spec 审查后）**：原计划的 `withStore` 只在 `req.onsuccess` resolve，
 > 且缺 `tx.onabort` / `tx.onerror`。这会导致配额错误（常在**事务提交时**才暴露）被误判为
@@ -793,7 +793,16 @@ git commit -m "feat(store): 记录关联 imageId，支持批量登记与删记�
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { assignByNearestY, boxCenterY, normalizeBox, unionBox } from './deviceBoxes'
+import {
+  assignNearest,
+  boxCenterX,
+  boxCenterY,
+  normalizeBox,
+  pointToBoxDistance,
+  unionBox,
+} from './deviceBoxes'
+
+type B = [number, number, number, number]
 
 describe('normalizeBox', () => {
   it('像素坐标转归一化坐标', () => {
@@ -806,37 +815,86 @@ describe('normalizeBox', () => {
   })
 })
 
-describe('boxCenterY', () => {
+describe('boxCenterY / boxCenterX', () => {
   it('取垂直中心', () => {
     expect(boxCenterY([0, 0.2, 1, 0.4])).toBeCloseTo(0.3)
   })
+  it('取水平中心', () => {
+    expect(boxCenterX([0.2, 0, 0.4, 1])).toBeCloseTo(0.3)
+  })
 })
 
-describe('assignByNearestY', () => {
-  const anchor = (y0: number, y1: number) => [0, y0, 1, y1] as [number, number, number, number]
+describe('pointToBoxDistance', () => {
+  it('点在框内为 0', () => {
+    expect(pointToBoxDistance(0.5, 0.5, [0.1, 0.1, 0.9, 0.9])).toBe(0)
+  })
+  it('正上方只算纵向距离（水平落在框内）', () => {
+    expect(pointToBoxDistance(0.5, 0.4, [0.1, 0.5, 0.9, 0.6])).toBeCloseTo(0.1)
+  })
+  it('斜角处取欧氏距离', () => {
+    // 点在 (0,0)，矩形左上角 (0.3,0.4) → √(0.3²+0.4²) = 0.5
+    expect(pointToBoxDistance(0, 0, [0.3, 0.4, 0.5, 0.6])).toBeCloseTo(0.5)
+  })
+})
 
-  it('每个条目归到 y 最近的锚点', () => {
+describe('assignNearest', () => {
+  const anchor = (y0: number, y1: number) => [0, y0, 1, y1] as B
+
+  it('每个条目归到最近的锚点', () => {
     const anchors = [anchor(0.1, 0.2), anchor(0.6, 0.7)]
     const items = [
       { box: anchor(0.12, 0.18) }, // → 锚点 0
       { box: anchor(0.65, 0.72) }, // → 锚点 1
       { box: anchor(0.55, 0.6) }, // → 锚点 1（0.575 更近 0.65 而不是 0.15）
     ]
-    expect(assignByNearestY(items, anchors, 0.3)).toEqual([0, 1, 1])
+    expect(assignNearest(items, anchors, 0.3)).toEqual([0, 1, 1])
   })
 
-  it('超出 maxDistance 的条目标为 -1', () => {
-    const anchors = [anchor(0.1, 0.2)]
-    expect(assignByNearestY([{ box: anchor(0.9, 0.95) }], anchors, 0.2)).toEqual([-1])
+  it('恰好等于 maxDistance 时保留，超出标为 -1', () => {
+    const anchors = [anchor(0.25, 0.25)]
+    const items = [
+      { box: anchor(0.5, 0.5) }, // 距离 0.25 == maxDistance → 保留
+      { box: anchor(0.75, 0.75) }, // 距离 0.5 > maxDistance → -1
+    ]
+    expect(assignNearest(items, anchors, 0.25)).toEqual([0, -1])
   })
 
   it('没有锚点时全部返回 -1', () => {
-    expect(assignByNearestY([{ box: anchor(0.1, 0.2) }], [], 0.5)).toEqual([-1])
+    expect(assignNearest([{ box: anchor(0.1, 0.2) }], [], 0.5)).toEqual([-1])
   })
 
   it('等距时取靠上的锚点（结果稳定可预测）', () => {
-    const anchors = [anchor(0.2, 0.3), anchor(0.4, 0.5)]
-    expect(assignByNearestY([{ box: anchor(0.34, 0.36) }], anchors, 1)).toEqual([0])
+    const anchors = [anchor(0.25, 0.25), anchor(0.75, 0.75)] // 中心 0.25 / 0.75
+    expect(assignNearest([{ box: anchor(0.5, 0.5) }], anchors, 1)).toEqual([0])
+  })
+
+  // ↓ 以下两条是「横构图串台」的回归用例。改成只看 y 之前，
+  //   它们都会把条目全归给第一个锚点，必须保持红。
+
+  it('设备左右并排、锚点中心 y 几乎相同时，按 x 归到各自那一台', () => {
+    // 三列：左 x0.02~0.32 / 中 0.36~0.66 / 右 0.70~0.98，锚点中心 y 只差 0.02
+    const anchors: B[] = [
+      [0.02, 0.5, 0.32, 0.54],
+      [0.36, 0.52, 0.66, 0.56],
+      [0.7, 0.505, 0.98, 0.545],
+    ]
+    const items = [
+      { box: [0.02, 0.45, 0.32, 0.49] as B }, // 左设备的条码
+      { box: [0.36, 0.47, 0.66, 0.51] as B }, // 中设备的条码
+      { box: [0.7, 0.455, 0.98, 0.495] as B }, // 右设备的条码
+    ]
+    expect(assignNearest(items, anchors, 0.25)).toEqual([0, 1, 2])
+  })
+
+  it('锚点很宽时，条码偏在一侧仍只按纵向距离归给它自己', () => {
+    // 这条同时锁住「不能改成两个中心的欧氏距离」：
+    // 条目中心 x 0.875 与锚点中心 x 0.5 差 0.375，用中心距算出来是 0.38 > 0.25 → 会被判成 -1；
+    // 用「点到框」则是 0.04，正确归给锚点 0。
+    const anchors: B[] = [
+      [0, 0.1, 1, 0.14],
+      [0, 0.6, 1, 0.64],
+    ]
+    expect(assignNearest([{ box: [0.8, 0.16, 0.95, 0.2] as B }], anchors, 0.25)).toEqual([0])
   })
 })
 
@@ -867,7 +925,7 @@ Expected: FAIL —— 找不到模块 `./deviceBoxes`。
 
 ```ts
 /**
- * 一图多码的几何工具：坐标归一化、按 y 轴就近归组、包围盒合并。
+ * 一图多码的几何工具：坐标归一化、二维就近归组、包围盒合并。
  *
  * 归一化坐标系：左上角为原点，x/y 均为 0~1 的比例值。
  * RapidOCR 返回的 box 已是这个坐标系；条码的 boundingBox 是像素坐标，需先归一化。
@@ -900,24 +958,54 @@ export function boxCenterY(box: Box4): number {
   return (box[1] + box[3]) / 2
 }
 
+/** 水平中心 */
+export function boxCenterX(box: Box4): number {
+  return (box[0] + box[2]) / 2
+}
+
 /**
- * 按 y 轴就近把条目分配到锚点。
- * 返回与 items 等长的数组，元素为锚点下标；超出 maxDistance 或无锚点时返回 -1。
- * 等距时取下标较小的锚点（即靠上的），保证结果稳定。
+ * 点到矩形的最短距离（点在矩形内为 0）。
+ *
+ * 为什么不直接用「两个中心的欧氏距离」：SN 文字行通常很宽（常横跨整幅），
+ * 中心 x 落在 0.5，而同一台设备的条码可能偏在一侧（中心 x 0.8）。
+ * 用中心距会把 Δx=0.3 算进去，设备上下排列时反而把自己的条码判成「太远」。
+ * 用「点到锚点框的距离」，条码只要在 SN 文字行的正上/正下方、或水平落在其范围内，
+ * 距离就只由纵向偏移决定 —— 竖排与横排两种布局都成立。
  */
-export function assignByNearestY(
+export function pointToBoxDistance(px: number, py: number, box: Box4): number {
+  const dx = Math.max(box[0] - px, 0, px - box[2])
+  const dy = Math.max(box[1] - py, 0, py - box[3])
+  return Math.hypot(dx, dy)
+}
+
+/**
+ * 把条目按二维就近分配到锚点：距离取「条目中心 → 锚点框」的最短距离。
+ *
+ * 必须用二维：设备**左右并排**时各锚点中心 y 几乎相同，只看 y 的话
+ * 「谁最近」退化成噪声，同一行的条码与 IMEI 会全部塌到某一个锚点上
+ * （实测：三台并排时左设备吞掉全部三条条码，中设备挂上了左设备的 IMEI，
+ * 另两个 IMEI 静默消失）。x 必须参与。
+ *
+ * 返回与 items 等长的数组，元素为锚点下标；超出 maxDistance 或无锚点时返回 -1。
+ * 等距时取下标较小的锚点，保证结果稳定。
+ * 前提：anchors 按中心 y 升序传入时，「下标较小」才等价于「几何上靠上」。
+ *
+ * maxDistance 传 Infinity 表示「不设上限、最近者得」——用于 OCR 文字行：
+ * 丢掉一行等于静默丢失一个 IMEI，比归错（界面上可见、可改）更糟。
+ */
+export function assignNearest(
   items: BoxedItem[],
   anchors: Box4[],
   maxDistance: number,
 ): number[] {
   if (!anchors.length) return items.map(() => -1)
-  const anchorYs = anchors.map(boxCenterY)
   return items.map((item) => {
-    const y = boxCenterY(item.box)
+    const px = boxCenterX(item.box)
+    const py = boxCenterY(item.box)
     let best = -1
     let bestDist = Infinity
-    for (let i = 0; i < anchorYs.length; i++) {
-      const d = Math.abs(anchorYs[i] - y)
+    for (let i = 0; i < anchors.length; i++) {
+      const d = pointToBoxDistance(px, py, anchors[i])
       if (d < bestDist) {
         bestDist = d
         best = i
@@ -948,7 +1036,7 @@ export function unionBox(boxes: Box4[]): Box4 | null {
 npx vitest run src/lib/deviceBoxes.test.ts
 ```
 
-Expected: `9 passed`。
+Expected: `15 passed`（normalizeBox 2 + boxCenterX/Y 2 + pointToBoxDistance 3 + assignNearest 6 + unionBox 2）。
 
 **Step 5: Commit**
 
@@ -981,9 +1069,16 @@ const line = (text: string, y0: number, y1: number, x0 = 0.1, x1 = 0.9): OcrLine
   box: [x0, y0, x1, y1],
 })
 
-const bar = (value: string, y0: number, y1: number): { value: string; box: Box4 } => ({
+// x0/x1 可选：默认跨满 0.1~0.9（竖构图用例），横构图用例要能指定各自的列
+const bar = (
+  value: string,
+  y0: number,
+  y1: number,
+  x0 = 0.1,
+  x1 = 0.9,
+): { value: string; box: Box4 } => ({
   value,
-  box: [0.1, y0, 0.9, y1],
+  box: [x0, y0, x1, y1],
 })
 
 describe('snFromLine', () => {
@@ -1086,6 +1181,80 @@ describe('buildCandidates', () => {
     expect(devices.map((d) => d.sn)).toEqual(['8A7C2D1E', '9B8D3E2F'])
   })
 
+  // ↓ 以下 4 条是「横构图串台 / 真 SN 被顶掉 / 同台设备两条候选 / IMEI 静默丢失」的回归用例。
+  //   修复前它们全部会失败，且都是**静默**出错（status 照样是 match/ocr_only，不报警）。
+
+  it('三台设备左右并排时，各自的条码与 IMEI 都不被邻居抢走', () => {
+    // 左列 x0.02~0.32 / 中列 0.36~0.66 / 右列 0.70~0.98；锚点中心 y 只差 0.02。
+    // 只看 y 时三条条码会全部归给左设备、左设备的 IMEI 会挂到中设备上、
+    // 另外两个 IMEI 直接消失。
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.50, 0.54, 0.02, 0.32),
+      line('IMEI1 356938035643801', 0.56, 0.60, 0.02, 0.32),
+      line('S/N: 9B8D3E2F', 0.52, 0.56, 0.36, 0.66),
+      line('IMEI1 356938035643902', 0.58, 0.62, 0.36, 0.66),
+      line('S/N: 7C6E5D4A', 0.505, 0.545, 0.70, 0.98),
+      line('IMEI1 356938035643703', 0.565, 0.605, 0.70, 0.98),
+    ]
+    const barcodes = [
+      bar('8A7C2D1E', 0.45, 0.49, 0.02, 0.32),
+      bar('9B8D3E2F', 0.47, 0.51, 0.36, 0.66),
+      bar('7C6E5D4A', 0.455, 0.495, 0.70, 0.98),
+    ]
+    const devices = buildCandidates(lines, barcodes)
+    expect(devices).toHaveLength(3)
+    // 返回顺序由 snBox 中心 y 决定，与本次断言无关，故按 sn 建索引查
+    const bySn = new Map(devices.map((d) => [d.sn, d]))
+    expect([...bySn.keys()].sort()).toEqual(['7C6E5D4A', '8A7C2D1E', '9B8D3E2F'])
+    expect(bySn.get('8A7C2D1E')).toMatchObject({
+      barcode: '8A7C2D1E',
+      imei: '356938035643801',
+      status: 'match',
+    })
+    expect(bySn.get('9B8D3E2F')).toMatchObject({
+      barcode: '9B8D3E2F',
+      imei: '356938035643902',
+      status: 'match',
+    })
+    expect(bySn.get('7C6E5D4A')).toMatchObject({
+      barcode: '7C6E5D4A',
+      imei: '356938035643703',
+      status: 'match',
+    })
+  })
+
+  it('图里出现重复的 SN 文本时，锚点自己的 SN 不被邻居那行顶掉', () => {
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.10, 0.14),
+      line('S/N: 8A7C2D1E', 0.30, 0.34),
+      line('S/N: 9B8D3E2F', 0.42, 0.46),
+    ]
+    const devices = buildCandidates(lines, [])
+    // 重复的 SN 只成一条候选；第二个锚点锚在 9B8D3E2F 上，就必须报 9B8D3E2F。
+    // 用 fields.sn 覆盖时会取到区域内第一行（8A7C2D1E），真 SN 静默丢失。
+    expect(devices.map((d) => d.sn)).toEqual(['8A7C2D1E', '9B8D3E2F'])
+  })
+
+  it('单台设备的条码离自己的 SN 行较远时，不另起一条重复候选', () => {
+    const lines = [line('S/N: 8A7C2D1E', 0.05, 0.09)]
+    // 条码中心 0.42，到 SN 框的距离 0.42-0.09 = 0.33，超过 MAX_ASSIGN_DISTANCE
+    const devices = buildCandidates(lines, [bar('8A7C2D1E', 0.40, 0.44)])
+    // 修复前会补一条同 SN 的 barcode_only，两条都默认勾选 → 用户登记两次
+    expect(devices).toHaveLength(1)
+    expect(devices[0].barcode).toBe('8A7C2D1E')
+    expect(devices[0].status).toBe('match')
+  })
+
+  it('单台设备时，离 SN 行较远的 IMEI 行仍归给它（文字行不设距离上限）', () => {
+    const lines = [
+      line('S/N: 8A7C2D1E', 0.05, 0.09),
+      line('IMEI1 356938035643809', 0.50, 0.54),
+    ]
+    const [d] = buildCandidates(lines, [])
+    // 距离 0.43 远超 0.25：若文字行也设上限，这个 IMEI 会被静默丢掉
+    expect(d.imei).toBe('356938035643809')
+  })
+
   it('同一 S/N 重复出现时只保留一条', () => {
     const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14), line('S/N: 8A7C2D1E', 0.30, 0.34)]
     expect(buildCandidates(lines, [])).toHaveLength(1)
@@ -1166,7 +1335,7 @@ import {
   extractSnCandidates,
   NON_SN_LABEL,
 } from './deviceFields'
-import { assignByNearestY, boxCenterY, type Box4 } from './deviceBoxes'
+import { assignNearest, boxCenterY, type Box4 } from './deviceBoxes'
 import type { VerifyStatus } from '@/types'
 
 /** OCR 返回的一行文字及其归一化坐标 */
@@ -1204,7 +1373,13 @@ export interface DeviceCandidate {
   barcodeBoxes: Box4[]
 }
 
-/** 归类距离上限（归一化纵向距离）。设备摆得再开，一屏内也远小于 0.25 */
+/**
+ * 条码归组的距离上限（归一化）。
+ * 语义是「条码中心 → S/N 文字框的最短距离」，**不是**两个中心之间的距离
+ * （见 deviceBoxes.pointToBoxDistance 的说明）。
+ * 0.25 约等于「一屏 4 台设备」时每台所占的高度量级。
+ * 只用于条码；OCR 文字行不设上限，见 buildCandidates 第 2 段。
+ */
 const MAX_ASSIGN_DISTANCE = 0.25
 
 // 非 SN 标签行（EID/IMEI/…）的判断统一用 deviceFields 导出的 NON_SN_LABEL，
@@ -1239,29 +1414,52 @@ export function buildCandidates(
     seenSn.add(sn)
     anchors.push({ sn, box: line.box })
   }
-  // 按中心 y 升序：assignByNearestY 的 tie-break 是「取下标较小」，
+  // 按中心 y 升序：assignNearest 的 tie-break 是「取下标较小」，
   // 只有锚点有序时它才等价于「几何上靠上」；也顺带让条码归属不受输入顺序影响。
   anchors.sort((a, b) => boxCenterY(a.box) - boxCenterY(b.box))
 
   const anchorBoxes = anchors.map((a) => a.box)
 
   // ---- 2. 条码归到最近的锚点；无锚点时每个条码自成一条 ----
-  const barcodeOwner = assignByNearestY(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
-  // 行归属：同样按 y 就近归到锚点（锚点自身距离为 0，必然归给自己）
-  const lineOwner = assignByNearestY(lines, anchorBoxes, MAX_ASSIGN_DISTANCE)
+  const barcodeOwner = assignNearest(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
+  // 行归属：同样按二维就近归到锚点（锚点自身距离为 0，必然归给自己）。
+  // 这里 maxDistance 传 Infinity —— 文字行**不设上限**：
+  // 一行没归到任何设备 = 静默丢掉一个 IMEI/EID，比归错（界面上看得见、能改）更糟。
+  // 条码则相反：画面里可能有不属于任何设备的条码（包装箱上的码），所以要设上限。
+  const lineOwner = assignNearest(lines, anchorBoxes, Infinity)
+
+  // 未被任何锚点认领、但值与某个锚点 SN 相同的条码：直接归给那个锚点。
+  // 不这么做它会在第 4 段另起一条 barcode_only，与锚点候选重复 ——
+  // 同一台设备出现两条默认勾选的候选，用户会把它登记两次。
+  // 触发条件：设备自己的条码离自己的 SN 行超过 MAX_ASSIGN_DISTANCE（如单台大设备占满画面）。
+  const effectiveOwner = [...barcodeOwner]
+  const anchorBySn = new Map(anchors.map((a, i) => [a.sn, i]))
+  barcodes.forEach((b, i) => {
+    if (effectiveOwner[i] !== -1) return
+    const hit = anchorBySn.get(b.value)
+    if (hit !== undefined) effectiveOwner[i] = hit
+  })
 
   const makeFromAnchor = (index: number): DeviceCandidate => {
     const anchor = anchors[index]
-    const ownedBarcodes = barcodes.filter((_, i) => barcodeOwner[i] === index)
+    const ownedBarcodes = barcodes.filter((_, i) => effectiveOwner[i] === index)
     // 该设备区域的 OCR 行：就近归组，锚点自身也算
     const ownedLines = lines.filter((_, i) => lineOwner[i] === index)
     const regionText = ownedLines.map((l) => l.text).join('\n')
     const allBarcodeValues = ownedBarcodes.map((b) => b.value)
 
     const fields = extractDeviceFields(regionText, allBarcodeValues)
-    // 锚点行本身可能是 "S/N: XXX"，extractDeviceFields 也能取到；取不到就用锚点值
-    const sn = fields.sn?.value ?? anchor.sn
+    // SN 以锚点为准，**不要**用 fields.sn 覆盖：regionText 是本区域全部行的拼接，
+    // 而 extractDeviceFields 取的是其中**第一个** S/N 标记行。图里一旦出现重复的 SN 文本
+    // （同一张标签被拍到两次、或 OCR 重复输出），邻居那行会排在锚点自己那行前面，
+    // 真 SN 就被顶掉、静默变成别人的 SN。
+    // 实测：S/N 行依次为 8A7C2D1E@0.12 / 8A7C2D1E@0.32 / 9B8D3E2F@0.42 时，
+    // 第二个锚点（锚在 9B8D3E2F 上）产出的是 8A7C2D1E，真值彻底丢失。
+    const sn = anchor.sn
 
+    // 精确比较即可：条码值在 recognize.ts 的 toHit 里已过 normalizeSn（大写、只留字母数字），
+    // SN 也来自 extractSnByMarker / extractSnCandidates（同样已大写化、去分隔符）。
+    // 若日后有调用方直接传入未归一化的值，再改用 deviceFields 的 matchBarcode 归一化比较。
     const matched = allBarcodeValues.find((b) => b === sn) ?? null
     let status: VerifyStatus
     if (allBarcodeValues.length && matched) status = 'match'
@@ -1313,7 +1511,7 @@ export function buildCandidates(
 
   // ---- 4. 有锚点但有条码未被任何锚点认领：各成一条，避免漏登记 ----
   if (anchors.length) {
-    const unowned = barcodes.filter((_, i) => barcodeOwner[i] === -1)
+    const unowned = barcodes.filter((_, i) => effectiveOwner[i] === -1)
     for (const b of unowned) {
       devices.push({
         sn: b.value,
@@ -1348,7 +1546,7 @@ export function buildCandidates(
 npx vitest run src/lib/multiRecognize.test.ts
 ```
 
-Expected: **15 passed**（`snFromLine` 5 条 + `buildCandidates` 10 条；全仓 `npx vitest run` 应为 50 passed）。
+Expected: **19 passed**（`snFromLine` 5 条 + `buildCandidates` 14 条；全仓 `npx vitest run` 应为 **60 passed**）。
 **若「同一条码只被一台设备认领」或「条码落在两个 S/N 行之间」
 用例失败**，说明 `assignByNearestY` 的归组结果与预期不符 —— 检查 `MAX_ASSIGN_DISTANCE`
 是否覆盖了测试数据的距离，不要靠改测试来迁就实现。
@@ -1708,7 +1906,7 @@ describe('markUnverified', () => {
 npx tsc -b && npx vitest run
 ```
 
-Expected: 无类型错误；**52 passed**（Task 6 的 50 + `markUnverified` 2 条）。
+Expected: 无类型错误；**62 passed**（Task 6 修订后的 60 + `markUnverified` 2 条）。
 
 按本项目标准，这两条也要做**变异验证**：把 `markUnverified` 里 `d.status === 'barcode_only' ? d : {...}`
 的三元分支去掉（一律降级），第二条必须变红；把 `status: 'pending'` 改回 `d.status`，第一条必须变红。
@@ -2960,7 +3158,7 @@ git commit -m "feat(export): Excel 导出，记录行嵌缩略图 + 原图页"
 npx vitest run
 ```
 
-Expected: 全部通过（smoke 1 + imageStore 8 + store 2 + deviceBoxes 9 + multiRecognize 12 + exportExcel 6）。
+Expected: 全部通过，**68 passed**（smoke 1 + imageStore 18 + store 7 + deviceBoxes 15 + multiRecognize 21 + exportExcel 6）。
 
 **Step 2: 逐条对照设计文档的验收标准**
 
@@ -2996,7 +3194,8 @@ superpowers:finishing-a-development-branch 决定合并方式。
 
 | 风险 | 应对 |
 |---|---|
-| 多个条码密集排列时 y 轴就近配对可能串台 | 界面允许逐行改 SN；`assignByNearestY` 的 `MAX_ASSIGN_DISTANCE` 是唯一旋钮 |
+| **（已修）** 横构图下设备左右并排、锚点中心 y 几乎相同，只看 y 会整片串台（条码全归一台、IMEI 挂错设备、其余 IMEI 静默丢失） | `assignNearest` 改用「条目中心 → 锚点框」的二维最短距离；4 条回归用例锁住（见 Task 6） |
+| 条码在水平方向上离自己那台设备的 SN 框太远（如条码贴在机身另一侧、SN 印在正面），二维就近仍可能归给邻居 | 这是几何上真实的歧义，无法靠距离消除；界面逐行可改 SN 与勾选。`MAX_ASSIGN_DISTANCE` 控制条码归属半径（文字行不设上限，宁可归错也不静默丢弃） |
 | exceljs 与 Vite 的兼容问题（`default` 导出形式） | 代码里已做 `mod.default ?? mod` 兼容；若仍失败，在 `vite.config.ts` 加 `optimizeDeps.include: ['exceljs']` |
 | 缩略图嵌在单元格里，Excel 行高不够会显示不全 | 行高按 `THUMB_MAX_H` 折算设置；导出后需人工抽查一次 |
 | 大量记录导出时内存占用高 | 已加进度提示；超过 200 条时可在界面上提示分批导出 |
