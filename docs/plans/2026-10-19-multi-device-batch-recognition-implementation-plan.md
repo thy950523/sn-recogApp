@@ -2055,7 +2055,7 @@ git commit -m "feat(multi): 识别主入口，接 zxing 条码与服务端 OCR�
 
 ```tsx
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { recognizeMulti, type DeviceCandidate, type MultiRecognizeResult } from '@/lib/multiRecognize'
+import { recognizeMulti, type MultiRecognizeResult } from '@/lib/multiRecognize'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
 
@@ -2097,7 +2097,9 @@ export default function MultiResultView({ image, onRetake }: Props) {
   const [result, setResult] = useState<MultiRecognizeResult | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
   /** 当前高亮的候选下标（点列表行时联动高亮框） */
-  const [activeIndex, setActiveIndex] = useState<number | null>(null)
+  // 本步只读不写：setter 到 Task 9 点列表行时才用得上，
+  // 现在解构出来会触发 TS6133。Task 9 记得把 `, setActiveIndex` 加回来。
+  const [activeIndex] = useState<number | null>(null)
   // 通过 Vite proxy 自动代理到本机 OCR 服务；放在组件内而非模块级，
   // 避免模块被导入到非浏览器环境时直接访问 window 报错
   const OCR_SERVER_URL = window.location.origin
@@ -2113,11 +2115,16 @@ export default function MultiResultView({ image, onRetake }: Props) {
     let alive = true
     const img = new Image()
     img.onload = async () => {
-      const canvas = document.createElement('canvas')
-      canvas.width = img.width
-      canvas.height = img.height
-      canvas.getContext('2d')!.drawImage(img, 0, 0)
       try {
+        // 画布构造与绘制也放进 try。
+        // 放在外面的话，drawImage 一旦抛错（例如图片被判定为跨域污染），
+        // 异常会从 async 的 onload 里逃出去变成一个没人处理的 promise rejection，
+        // 而 setFailed 永远不会被调用 —— 界面就永远停在「准备识别…」的转圈上。
+        // 那正是本项目最忌讳的「静默失败」。
+        const canvas = document.createElement('canvas')
+        canvas.width = img.width
+        canvas.height = img.height
+        canvas.getContext('2d')!.drawImage(img, 0, 0)
         const r = await recognizeMulti(canvas, OCR_SERVER_URL, (s) => {
           if (alive) setStage(s)
         })
@@ -2232,6 +2239,14 @@ Expected: 无错误。`Props` 里的 `existingSns` / `onRegister` / `imageId` �
 （Task 9 才用），因此不会触发 `noUnusedLocals`；不要用 `_` 前缀改名占位，
 那会让 Task 9 再改回来，徒增噪音。
 
+**接口成员不受 `noUnusedLocals` 管辖，但导入和局部变量受。** 所以本步还要砍掉两处
+「骨架里用不上、但 Task 9 会用到」的东西 —— 上面代码块里已经砍好了，
+这里说明原因，免得执行时以为漏抄了：
+- `type DeviceCandidate`：骨架没用到（`devices` 由 `result?.devices` 推导）。
+- `setActiveIndex`：骨架只读 `activeIndex`，没人调 setter。
+
+两处都**不要**用 `_` 前缀或空语句糊弄过去 —— Task 9 会原样加回来。
+
 **Step 3: Commit**
 
 ```bash
@@ -2261,6 +2276,30 @@ Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表
 
 （把原来的 `))}` 对应改成 `})}`；`d` 不再来自 `devices` 而来自 `row.source`。）
 
+**顺带修一处 Task 8 的界面缺陷：贴顶的角标会压住页头。**
+
+序号角标用 `-translate-y-full` 向上翻转，占的是 `y0` 正上方那一条。当 SN 标签贴在照片上沿
+（`box[1]` 接近 0）时，角标会翻到原图容器**之外**，压住页头那行「批量识别 / N 台」——
+容器没有 `overflow-hidden`，所以它不会消失，只会盖住文字。实测照片里标签贴顶很常见（用户会凑近拍）。
+
+把角标那段改为：太靠上时就画在框内，不再向上翻。
+
+```tsx
+                {/* 序号角标：贴近画面上沿时改为画在框内，免得翻到容器外压住页头。
+                    0.04 是「角标高度 / 图片高度」的量级估算（角标约 14px，手机上一屏图片约 350px），
+                    不是精确值 —— 目的是兜住 y0≈0 这个必然溢出的情况，不是精确贴合。 */}
+                {badgeAnchor && (
+                  <span
+                    className={`absolute bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black ${
+                      badgeAnchor[1] < 0.04 ? '' : '-translate-y-full'
+                    }`}
+                    style={badgeStyle(badgeAnchor)}
+                  >
+                    {i + 1}
+                  </span>
+                )}
+```
+
 同时把 header 里的台数改为跟随 `rows`：
 
 ```tsx
@@ -2273,6 +2312,18 @@ Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表
 
 ```tsx
 export default function MultiResultView({ image, existingSns, onRetake, onRegister, imageId }: Props) {
+```
+
+**同时要把 Task 8 为过编译而砍掉的两处加回来**，否则本步编译不过：
+
+```tsx
+// 顶部 import：本步要用 DeviceCandidate 做 rows 的元素类型
+import { recognizeMulti, type DeviceCandidate, type MultiRecognizeResult } from '@/lib/multiRecognize'
+```
+
+```tsx
+// 组件内：本步点列表行要联动高亮，setter 终于有人调了
+const [activeIndex, setActiveIndex] = useState<number | null>(null)
 ```
 
 在组件内、`devices` 之后加入：
