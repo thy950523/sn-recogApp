@@ -1433,15 +1433,19 @@ async function callServerOcr(
     if (!blob) return null
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
-    const res = await fetch(`${serverUrl}/ocr`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'image/jpeg', 'X-Ocr-Id': `multi-${Date.now()}` },
-      body: blob,
-      signal: controller.signal,
-    })
-    clearTimeout(timer)
-    if (!res.ok) return null
-    return (await res.json()) as ServerOcrResponse
+    try {
+      const res = await fetch(`${serverUrl}/ocr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'image/jpeg', 'X-Ocr-Id': `multi-${Date.now()}` },
+        body: blob,
+        signal: controller.signal,
+      })
+      if (!res.ok) return null
+      return (await res.json()) as ServerOcrResponse
+    } finally {
+      // 放在 finally：fetch 抛错（断网/中止）时也要清掉，否则定时器会挂到超时
+      clearTimeout(timer)
+    }
   } catch {
     return null
   }
@@ -1482,13 +1486,29 @@ export async function recognizeMulti(
         conf: typeof l.conf === 'number' ? l.conf : 0,
         box: [l.box[0], l.box[1], l.box[2], l.box[3]] as Box4,
       }))
+
+    if (lines.length) {
+      return {
+        devices: buildCandidates(lines, barcodes),
+        rawText: server.text,
+        engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
+        degraded: false,
+        error: null,
+      }
+    }
+
+    // 服务器有文本但没有坐标（如中转层的 Tesseract 分支）：
+    // 不能因为没坐标就把这段 OCR 文本丢掉，否则 SN/IMEI 信息全没了。
+    // 合成坐标只用于按顺序归组，snBox 一律置空（不画框）。
+    const synth: OcrLine[] = server.text
+      .split(/\r?\n/)
+      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
     return {
-      devices: buildCandidates(lines, barcodes),
+      devices: buildCandidates(synth, barcodes).map((d) => ({ ...d, snBox: null })),
       rawText: server.text,
       engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
-      // Tesseract 兜底路径没有坐标，无法画框
-      degraded: !lines.length,
-      error: null,
+      degraded: true,
+      error: 'OCR 未返回文字坐标，已按文本识别，但无法在原图上标注位置',
     }
   }
 
@@ -1499,12 +1519,15 @@ export async function recognizeMulti(
     const worker = await preloadOcr()
     const { data } = await worker.recognize(canvas)
     const text = data.text ?? ''
-    // 无坐标：按「一行一条」构造，全部标为仅 OCR，由人工确认
+    // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
+    // **绝不能拿去画框** —— 见下方 devices.map 把 snBox 置空。
     const lines: OcrLine[] = text
       .split(/\r?\n/)
       .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
     return {
-      devices: buildCandidates(lines, barcodes),
+      // 合成坐标是假的，必须把 snBox 置空，否则界面会在原图上画出凭空的黄框。
+      // barcodeBoxes 保留：条码是 zxing 在原图上真实检测到的，位置可信。
+      devices: buildCandidates(lines, barcodes).map((d) => ({ ...d, snBox: null })),
       rawText: text,
       engine: 'tesseract',
       degraded: true,
