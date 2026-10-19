@@ -317,6 +317,8 @@ app.post('/ocr', express.raw({ type: ['image/png', 'image/jpeg', 'application/oc
         return res.json({
           engine: 'rapidocr',
           text: r.text || '',
+          // 文字行坐标（归一化 [x0,y0,x1,y1]），前端据此在原图上画标注框
+          lines: Array.isArray(r.lines) ? r.lines : [],
           confidence: r.confidence ?? 0,
           ms: recogMs,
           setupMs: 0,
@@ -345,7 +347,8 @@ app.post('/ocr', express.raw({ type: ['image/png', 'image/jpeg', 'application/oc
     console.log(`            文本: "${text.substring(0, 80)}"`)
     console.log(`            调试图: ${debugFilename}`)
 
-    res.json({ engine: 'tesseract', text, confidence: data.confidence ?? 0, ms, setupMs, recogMs })
+    // Tesseract 路径无坐标信息，lines 固定为空数组
+    res.json({ engine: 'tesseract', text, lines: [], confidence: data.confidence ?? 0, ms, setupMs, recogMs })
   } catch (err) {
     console.error('[OCR] 失败:', err.message)
     res.status(500).json({ error: err.message })
