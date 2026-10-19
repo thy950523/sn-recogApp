@@ -2856,9 +2856,17 @@ export default function Home() {
     } catch (e) {
       console.warn('[image] 保存失败，本次登记将不带图片:', e)
     }
-    setScreen({ name: 'multi', image, key: Date.now(), imageId })
+    setScreen({ name: 'multi', image, key: ++shotSeq.current, imageId })
   }, [])
 ```
+
+> **勘误（执行时必读）**：上面这行原写作 `key: Date.now()`。**那是过期的，不要退回去。**
+> Task 10 的复审发现：两次拍照若落在同一毫秒，`Date.now()` 给出相同 key → React
+> **不重挂载** `MultiResultView` → 退化成「同实例原地换图」，而那条路径正是
+> `MultiResultView` 注释里写明的已知漏洞（B-6 换图不清 `result`/`failed`/`stage`；
+> B-7 `urlRef` 竞态），后果是**旧图的标注框与候选行顶在新照片上，用户确认后登记错的
+> SN**。已改为单调自增序号 `++shotSeq.current`（`Home.tsx` 里有 `useRef(0)` 与其
+> 说明注释），Task 11 只是把 `imageId` 加进 `setScreen` 的参数。
 
 **Step 1b: 释放 savingRef 锁（两条回扫屏的路径都要加）**
 
@@ -3611,4 +3619,6 @@ superpowers:finishing-a-development-branch 决定合并方式。
 | 缩略图嵌在单元格里，Excel 行高不够会显示不全 | 行高按 `THUMB_MAX_H` 折算设置；导出后需人工抽查一次 |
 | 大量记录导出时内存占用高 | 已加进度提示；超过 200 条时可在界面上提示分批导出 |
 | **`recognizeSn` 成了孤儿**（Task 10 删 `ResultView` 的副作用）：它是单拍 OCR 链路的入口，`ResultView` 是它唯一的调用方。删掉 `ResultView` 后，`recognizeSn`（`recognize.ts` 的 `export async function recognizeSn` 起至文件末，约 195 行）连同它私有的 `runServerOcr` / `extractTextStrip` / `cropBelowBarcode` / `containsBarcode` 全部不可达，且**无测试**——但代码看起来是活的，后来者会误以为它在生效 | Task 10 的清理判据只查了 `grep -rn "ResultView"`，查不出「调用方被删、被调用方成孤儿」这类死代码（**判据应从「grep 被删文件」升级为「对 `recognize.ts` 做一次未引用导出扫描」**）。收尾轮已就地加了「当前无入口」的显著注释。**删除与否尚未决策**：删它要连带改写 `multiRecognize.ts` 里 5 处把它当参照物的设计说明注释（那些注释记着「为何不复用 `runServerOcr`」的硬约束）与 `deviceFields.ts:3` 的注释，属人工决策范围，**需与用户确认**（这里刻意不写行号：加注释后行号已从 487 漂到 499，写死行号会再次过期） |
+| **第三条 IMEI 被静默丢弃**：`SnRecord` 只有 `imei` / `imei2` 两个字段。机身上若真印了 `IMEI3:`，或 1、2 槽位已被占满而「未标槽位」那条补不到空位（`extractDeviceFields` 里 `if (free > 2) return f` 会让它保持 `slot: null`），这条 IMEI 不会出现在任何字段里 | 改动**前后行为一致**（`imeiBySlot` 对 `slot === null` 取不到，与旧写法 `imeis[0]`/`[1]` 在 1、2 占满时取不到第三者效果相同），**不是本次引入的回归**。但 `QuickConfirmCard.tsx` 的展示列表是按 `slot` 打标签的，会把第三条显示成 `IMEI3` 而字段里没有它 —— 界面与落库不一致。三 IMEI 的机型罕见，**本次明确不做**（加字段要动 `SnRecord` 类型、CSV/Excel 表头、`registerRows` 映射），列为独立事项 |
+| **IMEI 字段写反**（本次已根治，留档说明改法）：机身排版是「`IMEI:` + `IMEI2:`」时，未标槽位那条的 `slot` 为 `null`，而消费侧按**数组下标**取 `imei`/`imei2`，于是两个字段的标签整体写反 | 分两步修：`bfabd22` 让未标槽位的 IMEI **补进最低空闲槽位**（让那条不丢值、落进槽位 1）；`95beff5` 再把消费侧从「按下标取」改成**按槽位取**（`imeiBySlot(imeis, 1/2)`）。只做第一步不够：「槽位 1 整个缺席、槽位 2 存在」时（机身只印 `IMEI2:`、或 OCR 漏读 `IMEI1` 那行）`imeis[0].slot === 2`，按下标取仍会把 IMEI2 的值填进 `imei` 字段。确认页里这两格是**只读文本**，用户无法手工修正，属静默错误数据，故必须根治 |
 | **`addMany` 的 `setRecords` 落库那一行没有自动化测试**：记录构造已抽成纯函数 `buildManyRecords`（`store.ts`）并被测试钉住（空列表、id 互不相同、字段透传、同毫秒批量 id 不撞），但「把 `created` 追加进 `records`」这一行 —— `setRecords((prev) => [...prev, ...created])` —— 仍未被任何用例覆盖 | **为什么没补**：要观察 `records` 的变化必须真正挂载 `useRecords` 这个 React hook，而挂载 hook 需要引入渲染器依赖（jsdom + @testing-library/react），本计划 Task 2 已明确决定**不引入 jsdom**（本次要测的都是纯函数与 IndexedDB，`environment: 'node'` 够用），为一个 4 行函数引入 3 个依赖与在功能分支中途推翻依赖决定不成比例。**将来若要补**：为 `store.test.ts` 单独加 `// @vitest-environment jsdom` 文件头 + `renderHook`，或（更符合本仓库「抽成纯函数」套路的做法）把「追加」这一步也抽成纯函数 `appendRecords(prev, created)` 再用纯函数测试覆盖 |
