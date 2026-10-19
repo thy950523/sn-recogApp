@@ -50,7 +50,7 @@
 
 ```bash
 cd /Users/zhuzhong/Downloads/sn_recogApp
-npm i -D vitest fake-indexeddb
+pnpm add -D vitest fake-indexeddb
 ```
 
 > `fake-indexeddb` 用于在 Node 里测试 IndexedDB 代码（Task 3）。
@@ -117,7 +117,7 @@ Expected: `1 passed`，退出码 0。
 **Step 6: Commit**
 
 ```bash
-git add package.json package-lock.json vitest.config.ts src/lib/smoke.test.ts
+git add package.json pnpm-lock.yaml vitest.config.ts src/lib/smoke.test.ts
 git commit -m "test: 引入 vitest 测试基建"
 ```
 
@@ -1339,9 +1339,30 @@ export function buildCandidates(
 npx vitest run src/lib/multiRecognize.test.ts
 ```
 
-Expected: 若全部通过则进入 Step 6。**若「同一条码只被一台设备认领」或「条码落在两个 S/N 行之间」
+Expected: **15 passed**（`snFromLine` 5 条 + `buildCandidates` 10 条；全仓 `npx vitest run` 应为 50 passed）。
+**若「同一条码只被一台设备认领」或「条码落在两个 S/N 行之间」
 用例失败**，说明 `assignByNearestY` 的归组结果与预期不符 —— 检查 `MAX_ASSIGN_DISTANCE`
 是否覆盖了测试数据的距离，不要靠改测试来迁就实现。
+
+> **修订（执行后补测）**：上面 10 条里最后一条是补充的 —— `buildCandidates` 第 4 段
+> （「有锚点但条码离所有锚点都超过 `MAX_ASSIGN_DISTANCE`」→ 追加 `barcode_only` 候选）
+> 原本**没有任何用例覆盖**，因为规格里所有条码都落在阈值内，`-1` 分支从未执行。
+> 补一条让它可测：
+
+```ts
+  it('条码离所有 S/N 行都超出阈值时，补一条 barcode_only 以免漏登记', () => {
+    const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14)]
+    // 条码中心 0.90，距锚点中心 0.12 有 0.78，远超 MAX_ASSIGN_DISTANCE(0.25)
+    const barcodes = [bar('9B8D3E2F', 0.88, 0.92)]
+    const devices = buildCandidates(lines, barcodes)
+    expect(devices).toHaveLength(2)
+    expect(devices[0].sn).toBe('8A7C2D1E')
+    expect(devices[0].status).toBe('ocr_only')
+    expect(devices[1].sn).toBe('9B8D3E2F')
+    expect(devices[1].status).toBe('barcode_only')
+    expect(devices[1].barcodeBoxes).toEqual([[0.1, 0.88, 0.9, 0.92]])
+  })
+```
 
 **Step 6: 类型检查**
 
@@ -2405,8 +2426,11 @@ git commit -m "feat(ui): 记录页显示缩略图与图片占用，清空时连�
 **Step 1: 安装 exceljs**
 
 ```bash
-npm i exceljs
+pnpm add exceljs
 ```
+
+> 用 pnpm，不要用 npm —— `node_modules` 是 pnpm 的符号链接布局，`npm i` 会以 EISDIR 失败并破坏它。
+> 提交 `pnpm-lock.yaml`；根目录那个 `package-lock.json` 是历史遗留（已跟踪但早已不同步），本次不动它。
 
 **Step 2: 写失败的测试（纯函数部分）**
 
@@ -2775,7 +2799,7 @@ Expected: 全部通过。
 **Step 10: Commit**
 
 ```bash
-git add package.json package-lock.json src/lib/exportExcel.ts src/lib/exportExcel.test.ts src/lib/export.ts src/sections/RecordsView.tsx
+git add package.json pnpm-lock.yaml src/lib/exportExcel.ts src/lib/exportExcel.test.ts src/lib/export.ts src/sections/RecordsView.tsx
 git commit -m "feat(export): Excel 导出，记录行嵌缩略图 + 原图页"
 ```
 
