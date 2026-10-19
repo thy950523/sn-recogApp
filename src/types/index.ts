@@ -61,6 +61,11 @@ export interface SnRecord {
   eid?: string | null
   /** 全部 OCR 原文（提取不到字段时人工核对用） */
   rawOcr?: string | null
+  /**
+   * 关联的原始照片 id（IndexedDB 主键）。
+   * localStorage 只存这个 id，图片数据本身存在 IndexedDB。
+   */
+  imageId?: string
 }
 
 /**
