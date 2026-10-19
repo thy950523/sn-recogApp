@@ -1,10 +1,5 @@
-// @vitest-environment jsdom
-//
-// addMany 是 useRecords 内部的 hook 方法，要观察「写入后 records 的长度」必须真正挂载
-// 这个 hook —— 所以本文件单独切到 jsdom 环境（其余用例仍是纯函数，不受影响）。
-import { beforeEach, describe, expect, it } from 'vitest'
-import { act, renderHook } from '@testing-library/react'
-import { collectImageIds, droppedImageIds, useRecords } from './store'
+import { describe, expect, it } from 'vitest'
+import { buildManyRecords, collectImageIds, droppedImageIds } from './store'
 import type { SnRecord } from '@/types'
 
 const rec = (id: string, imageId?: string): SnRecord => ({
@@ -58,39 +53,52 @@ describe('droppedImageIds', () => {
   })
 })
 
-/** 造一条待登记记录（addMany 的入参：无 id / time） */
-const entry = (sn: string): Omit<SnRecord, 'id' | 'time'> => ({
+/** 造一条待登记记录（buildManyRecords 的入参：无 id / time） */
+const entry = (sn: string, imageId?: string): Omit<SnRecord, 'id' | 'time'> => ({
   sn,
   source: 'barcode',
   verified: true,
   barcode: sn,
   barcodes: [],
   ocr: null,
+  imageId,
 })
 
-describe('useRecords.addMany', () => {
-  beforeEach(() => {
-    // useRecords 初始化时会读 localStorage；清空以免用例间互相污染
-    localStorage.clear()
+describe('buildManyRecords', () => {
+  it('空列表返回空数组', () => {
+    expect(buildManyRecords([], 1000)).toEqual([])
   })
 
-  it('一次写入 N(≥2) 条：N 条都入库、id 互不相同、records 长度正确', () => {
-    const { result } = renderHook(() => useRecords())
-    expect(result.current.records).toHaveLength(0)
+  it('N=3：长度 3、id 两两互不相同、time 全部等于注入的 now', () => {
+    const created = buildManyRecords([entry('SN-A'), entry('SN-B'), entry('SN-C')], 1000)
 
-    let ids: string[] = []
-    act(() => {
-      ids = result.current.addMany([entry('SN-A'), entry('SN-B'), entry('SN-C')])
-    })
+    expect(created).toHaveLength(3)
+    const ids = created.map((r) => r.id)
+    expect(new Set(ids).size).toBe(3) // id 两两互不相同
+    expect(created.every((r) => r.time === 1000)).toBe(true) // time 统一为注入值
+  })
 
-    // 返回值：3 个 id 且互不相同
-    expect(ids).toHaveLength(3)
+  it('透传入参字段（sn / imageId）', () => {
+    const created = buildManyRecords([entry('SN-A', 'img-a'), entry('SN-B')], 1000)
+
+    expect(created.map((r) => r.sn)).toEqual(['SN-A', 'SN-B'])
+    expect(created.map((r) => r.imageId)).toEqual(['img-a', undefined])
+  })
+
+  it('同毫秒批量（显式注入同一个 now）时 id 仍互不相同', () => {
+    // 这是最容易写错、也最该被钉住的一点：若 id 只用 now 而不带批内下标 i，
+    // 同一 now 下 3 条记录的 id 会完全相同。
+    const created = buildManyRecords([entry('SN-A'), entry('SN-B'), entry('SN-C')], 12345)
+    const ids = created.map((r) => r.id)
     expect(new Set(ids).size).toBe(3)
-    // 写入后 records：长度正确、3 条都在、各记录 id 互不相同且与返回值一致
-    expect(result.current.records).toHaveLength(3)
-    expect(result.current.records.map((r) => r.sn)).toEqual(['SN-A', 'SN-B', 'SN-C'])
-    const recordIds = result.current.records.map((r) => r.id)
-    expect(new Set(recordIds).size).toBe(3)
-    expect(recordIds).toEqual(ids)
+  })
+
+  it('默认 now 取自当前时钟（不注入时用 Date.now()）', () => {
+    const before = Date.now()
+    const created = buildManyRecords([entry('SN-A')])
+    const after = Date.now()
+
+    expect(created[0].time).toBeGreaterThanOrEqual(before)
+    expect(created[0].time).toBeLessThanOrEqual(after)
   })
 })
