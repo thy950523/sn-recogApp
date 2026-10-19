@@ -71,10 +71,18 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // 同时收集 .ts / .tsx / .spec.*：否则新增的测试文件会被静默漏掉（绿着但没跑）
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 })
 ```
+
+> **修订（代码质量审查后）**：原计划写的是 `include: ['src/**/*.test.ts']`，
+> 那样会静默漏掉 `.test.tsx` 与 `.spec.ts` —— `vitest run` 会绿着通过但零测试运行。
+> 已放宽为上面的写法。
+>
+> 同时把 `vitest.config.ts` 加进 `tsconfig.node.json` 的 `include`，
+> 否则 `tsc -b` 从不检查这个文件。
 
 **Step 3: 新建 `src/lib/smoke.test.ts`**
 
