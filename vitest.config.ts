@@ -7,6 +7,7 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // 同时收集 .ts / .tsx / .spec.*：否则新增的测试文件会被静默漏掉（绿着但没跑）
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 })
