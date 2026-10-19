@@ -241,17 +241,25 @@ describe('markUnverified', () => {
     ...over,
   })
 
-  it('锚点类候选降为 pending 并清空 snBox（合成坐标不能画框）', () => {
+  const NOTE = 'OCR 未返回文字坐标，设备配对未经位置校验，请人工核对'
+
+  it('锚点类候选降为 pending，并清空 snBox 与 barcodeBoxes', () => {
     const out = markUnverified([
-      cand({ status: 'match', barcode: '8A7C2D1E' }),
-      cand({ status: 'mismatch' }),
+      cand({ status: 'match', barcode: '8A7C2D1E', barcodeBoxes: [[0.1, 0.4, 0.9, 0.44]] }),
+      cand({ status: 'mismatch', barcodeBoxes: [[0.1, 0.6, 0.9, 0.64]] }),
       cand({ status: 'ocr_only' }),
     ])
     // 降级后不能再出现 match/mismatch —— 否则一张好照片会被标成「与条码不一致」，
     // 用户会据此丢掉正确数据
     expect(out.map((d) => d.status)).toEqual(['pending', 'pending', 'pending'])
     expect(out.every((d) => d.snBox === null)).toBe(true)
-    expect(out[0].note).toContain('人工核对')
+    // barcodeBoxes 也要清空：框本身是真的，但「哪个框属于哪台设备」是按合成坐标
+    // 算的、会错配（实测后一台设备吞掉全部框）。留着它，界面就会画出一组
+    // 「看起来已经校验过」的归属。
+    expect(out.every((d) => d.barcodeBoxes.length === 0)).toBe(true)
+    // 断言**全等**而不是 toContain：要锁住 note 是「覆盖」。
+    // 若实现改成在原 note 后面拼接，toContain 仍然会绿。
+    expect(out.every((d) => d.note === NOTE)).toBe(true)
   })
 
   it('barcode_only 保持原样：条码位置是真实检测到的，不涉及合成坐标', () => {
@@ -264,5 +272,19 @@ describe('markUnverified', () => {
       note: '未读到 S/N 文字，仅有条码',
     })
     expect(markUnverified([b])).toEqual([b])
+  })
+
+  it('不修改入参对象，返回的是新对象', () => {
+    // 若有人把 `{ ...d }` 改成原地 `d.status = 'pending'`，上面两条用例**仍会全绿**，
+    // 但实现会开始改到调用方持有的共享对象。这条把它钉住。
+    const input = cand({ status: 'match', barcode: '8A7C2D1E' })
+    const out = markUnverified([input])
+    expect(input.status).toBe('match')
+    expect(input.snBox).toEqual([0.1, 0.1, 0.9, 0.14])
+    expect(out[0]).not.toBe(input)
+  })
+
+  it('空数组返回空数组', () => {
+    expect(markUnverified([])).toEqual([])
   })
 })

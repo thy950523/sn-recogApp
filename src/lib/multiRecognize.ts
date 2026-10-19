@@ -269,8 +269,11 @@ async function callServerOcr(
   timeoutMs = 20000,
 ): Promise<ServerOcrResponse | null> {
   if (!serverUrl) return null
-  const upload = scaleForUpload(canvas, 1600)
   try {
+    // 放进 try：scaleForUpload 新建 canvas 并取 2d context，理论上可能抛错。
+    // 本函数的契约是「失败返回 null，由调用方降级」；若它抛出去，recognizeMulti
+    // 的 promise 会直接 reject，调用方还得自己兜 —— 那不是这个函数的契约。
+    const upload = scaleForUpload(canvas, 1600)
     const blob = await new Promise<Blob | null>((resolve) =>
       upload.toBlob(resolve, 'image/jpeg', 0.9),
     )
@@ -311,6 +314,12 @@ async function callServerOcr(
  * 位置也是真实的，不涉及合成坐标，标成「仅条码」比「待人工确认」信息量更大。
  *
  * `snBox` 同时置空：合成坐标绝不能拿去画框。
+ *
+ * `barcodeBoxes` 也一并置空。条码**框本身**确实是 zxing 在原图上真实检测到的，
+ * 但**哪个框属于哪台设备**是按合成坐标算出来的，会错配 —— 实测（4 行文本 + 2 个条码）：
+ * 后一台设备吞掉了全部两个框，前一台一个都没有。留着它，界面就会画出一组
+ * 「看起来已经校验过」的归属，比不画更糟。条码的**值**仍在 `barcodes` 里，可供人工核对。
+ * （`barcode_only` 候选不在此列：它只有一个框、且就是它自己的，不受影响。）
  */
 export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
   return devices.map((d) =>
@@ -321,6 +330,7 @@ export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
           status: 'pending' as VerifyStatus,
           note: 'OCR 未返回文字坐标，设备配对未经位置校验，请人工核对',
           snBox: null,
+          barcodeBoxes: [],
         },
   )
 }
@@ -352,7 +362,8 @@ export async function recognizeMulti(
   onStage?.('正在识别文字…')
   const server = await callServerOcr(canvas, serverUrl)
 
-  if (server && typeof server.text === 'string') {
+  if (server) {
+    const serverText = typeof server.text === 'string' ? server.text : ''
     const lines: OcrLine[] = (server.lines ?? [])
       .filter((l) => l && typeof l.text === 'string' && Array.isArray(l.box) && l.box.length === 4)
       .map((l) => ({
@@ -361,34 +372,43 @@ export async function recognizeMulti(
         box: [l.box[0], l.box[1], l.box[2], l.box[3]] as Box4,
       }))
 
+    // 有坐标就用坐标，**与文本是否为空无关** —— 坐标比文本强。
     if (lines.length) {
       return {
         devices: buildCandidates(lines, barcodes),
-        rawText: server.text,
+        rawText: serverText,
         engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
         degraded: false,
         error: null,
       }
     }
 
-    // 服务器有文本但没有坐标（如中转层的 Tesseract 分支）：
+    // 有文本但没有坐标（如中转层的 Tesseract 分支）：
     // 不能因为没坐标就把这段 OCR 文本丢掉，否则 SN/IMEI 信息全没了。
-    // 合成坐标只用于按顺序归组；markUnverified 会置空 snBox（不画框）
+    // 合成坐标只用于按顺序归组；markUnverified 会置空 snBox / barcodeBoxes
     // 并把锚点类候选降为 pending —— 合成坐标算出的配对不可信。
-    const synth: OcrLine[] = server.text
-      .split(/\r?\n/)
-      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
-    return {
-      devices: markUnverified(buildCandidates(synth, barcodes)),
-      rawText: server.text,
-      engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
-      degraded: true,
-      error: 'OCR 未返回文字坐标，已按文本识别，但无法在原图上标注位置',
+    //
+    // 这里判的是 serverText.trim()，**不是** typeof serverText === 'string'：
+    // 服务端返回 200 但文本为空时，若就此 return，本地 Tesseract 兜底就被跳过了。
+    // 而 recognizeSn 在同样情况下会继续回退本地（它判的是真值），
+    // 两条链路对同一输入给出不同结果，是缺陷。文本为空就落到下面的分支 3。
+    if (serverText.trim()) {
+      const synth: OcrLine[] = serverText
+        .split(/\r?\n/)
+        .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
+      return {
+        devices: markUnverified(buildCandidates(synth, barcodes)),
+        rawText: serverText,
+        engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
+        degraded: true,
+        error: 'OCR 未返回文字坐标，已按文本识别，但无法在原图上标注位置',
+      }
     }
   }
 
   // ---- 3. 降级：本地 Tesseract，只有文本没有坐标 ----
   onStage?.('服务器不可用，使用本地 OCR…')
+  let text: string
   try {
     const { preloadOcr, PSM } = await import('./recognize')
     const worker = await preloadOcr()
@@ -397,25 +417,20 @@ export async function recognizeMulti(
     // （整图路径用 SPARSE_TEXT，裁切路径用 SINGLE_LINE/SINGLE_BLOCK）。
     // 不显式设置，这里就会继承上一次调用留下的模式，行为随调用顺序变化。
     // SPARSE_TEXT 与 recognizeSn 的整图路径一致，适合一张照片里散落的多个标签。
+    //
+    // 注意：这只解决**顺序**调用。若两个 OCR 流程**并发**跑在同一个 worker 上，
+    // setParameters 与 recognize 是两条独立消息、worker 不串行化，仍会互相覆盖。
+    // 该竞态是既有架构问题（两次并发 recognizeSn 之间同样存在），不在本次范围内，
+    // 已记入「已知风险」。
     await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
     const { data } = await worker.recognize(canvas)
-    const text = data.text ?? ''
-    // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
-    // **绝不能拿去画框**。
-    const lines: OcrLine[] = text
-      .split(/\r?\n/)
-      .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
-    return {
-      // 合成坐标是假的：markUnverified 置空 snBox（否则界面会在原图上画出凭空的黄框），
-      // 并把锚点类候选降为 pending（配对是按假坐标算的，不能当成已验证）。
-      // barcodeBoxes 保留：条码是 zxing 在原图上真实检测到的，位置可信。
-      devices: markUnverified(buildCandidates(lines, barcodes)),
-      rawText: text,
-      engine: 'tesseract',
-      degraded: true,
-      error: '服务器 OCR 不可用，已降级本地识别（无法标注位置）',
-    }
-  } catch {
+    text = data.text ?? ''
+  } catch (err) {
+    // try 只包住真正可能失败的那几步（动态 import / worker / recognize）。
+    // buildCandidates 与 markUnverified 是纯函数，**故意留在 try 外**：
+    // 它们若因代码 bug 抛错，应该炸出来，而不是被伪装成「OCR 全部失败，请手动输入」。
+    // 打日志：recognize.ts 的同类失败都有 console.warn，这里不打会让排查无从下手。
+    console.warn('[OCR 本地] 降级识别失败：', err)
     return {
       devices: buildCandidates([], barcodes),
       rawText: '',
@@ -423,5 +438,21 @@ export async function recognizeMulti(
       degraded: true,
       error: 'OCR 全部失败，请手动输入',
     }
+  }
+
+  // 无坐标：按「一行一条」构造合成坐标，仅供 buildCandidates 按顺序归组，
+  // **绝不能拿去画框**。
+  const lines: OcrLine[] = text
+    .split(/\r?\n/)
+    .map((t, i) => ({ text: t, conf: 0, box: [0, i * 0.05, 1, i * 0.05 + 0.04] as Box4 }))
+  return {
+    // 合成坐标是假的：markUnverified 置空 snBox **与 barcodeBoxes**
+    // （前者否则会在原图上画出凭空的黄框；后者框虽真、但归属是假的，见其注释），
+    // 并把锚点类候选降为 pending（配对是按假坐标算的，不能当成已验证）。
+    devices: markUnverified(buildCandidates(lines, barcodes)),
+    rawText: text,
+    engine: 'tesseract',
+    degraded: true,
+    error: '服务器 OCR 不可用，已降级本地识别（无法标注位置）',
   }
 }
