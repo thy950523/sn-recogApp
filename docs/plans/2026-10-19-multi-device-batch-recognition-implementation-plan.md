@@ -1238,6 +1238,8 @@ export function buildCandidates(
 
   // ---- 2. 条码归到最近的锚点；无锚点时每个条码自成一条 ----
   const barcodeOwner = assignByNearestY(barcodes, anchorBoxes, MAX_ASSIGN_DISTANCE)
+  // 行归属：同样按 y 就近归到锚点（锚点自身距离为 0，必然归给自己）
+  const lineOwner = assignByNearestY(lines, anchorBoxes, MAX_ASSIGN_DISTANCE)
 
   const makeFromAnchor = (index: number): DeviceCandidate => {
     const anchor = anchors[index]
@@ -1277,9 +1279,7 @@ export function buildCandidates(
     }
   }
 
-  // 行归属：需要先有锚点，故先算锚点再算行
-  const lineOwner = assignByNearestY(lines, anchorBoxes, MAX_ASSIGN_DISTANCE)
-
+  // 行归属已在上面算好，这里直接按归属生成各设备候选
   const devices: DeviceCandidate[] = anchors.map((_, i) => makeFromAnchor(i))
 
   // ---- 3. 没有锚点但有条码：每个条码各成一条「仅条码」----
