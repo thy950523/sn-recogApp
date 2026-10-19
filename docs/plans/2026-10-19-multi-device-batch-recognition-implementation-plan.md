@@ -333,7 +333,12 @@ function openDb(): Promise<IDBDatabase> {
   })
 }
 
-/** 在一个事务里执行操作，事务完成后再 resolve */
+/**
+ * 在一个事务里执行操作。
+ * 请求的 onsuccess 只负责取回结果，**事务 oncomplete 才算成功** ——
+ * 配额错误等常在提交时才暴露，若在请求成功就 resolve，会把「没存进去」当成「存成功」。
+ * 事务被中止时 reject，避免调用方永久 await。
+ */
 function withStore<T>(
   mode: IDBTransactionMode,
   fn: (store: IDBObjectStore) => IDBRequest<T>,
@@ -341,11 +346,44 @@ function withStore<T>(
   return openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const tx = db.transaction(STORE, mode)
-        const req = fn(tx.objectStore(STORE))
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error ?? new Error('图片数据库操作失败'))
-        tx.oncomplete = () => db.close()
+        let result: T
+        let settled = false
+        const fail = (err: unknown) => {
+          if (settled) return
+          settled = true
+          db.close()
+          reject(err instanceof Error ? err : new Error(String(err)))
+        }
+
+        let tx: IDBTransaction
+        try {
+          tx = db.transaction(STORE, mode)
+        } catch (err) {
+          fail(err)
+          return
+        }
+
+        let req: IDBRequest<T>
+        try {
+          // fn 可能同步抛错（如 put 非可克隆值时的 DataCloneError）
+          req = fn(tx.objectStore(STORE))
+        } catch (err) {
+          fail(err)
+          return
+        }
+
+        req.onsuccess = () => {
+          result = req.result
+        }
+        req.onerror = () => fail(req.error ?? new Error('图片数据库操作失败'))
+        tx.oncomplete = () => {
+          if (settled) return
+          settled = true
+          db.close()
+          resolve(result)
+        }
+        tx.onabort = () => fail(tx.error ?? new Error('图片数据库事务被中止'))
+        tx.onerror = () => fail(tx.error ?? new Error('图片数据库事务失败'))
       }),
   )
 }
@@ -448,6 +486,12 @@ npx vitest run src/lib/imageStore.test.ts
 ```
 
 Expected: `8 passed`。
+
+> **修订（spec 审查后）**：原计划的 `withStore` 只在 `req.onsuccess` resolve，
+> 且缺 `tx.onabort` / `tx.onerror`。这会导致配额错误（常在**事务提交时**才暴露）被误判为
+> 存图成功，以及事务提前中止时 Promise 永不 settle、调用方永久 await。
+> 已改为「请求取结果、事务提交才算成功、中止即 reject」。另外补了 3 条测试
+> （失败路径 reject、Object URL 缓存复用与释放、不存在 id 返回 null）。
 
 **Step 5: 类型检查**
 
