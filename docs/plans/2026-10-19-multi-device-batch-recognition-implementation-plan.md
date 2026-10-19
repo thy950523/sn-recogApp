@@ -2950,6 +2950,26 @@ export async function exportExcel(
   ws.getRow(1).font = { bold: true }
   ws.getRow(1).height = 20
 
+  /** imageId → 该图登记到的 SN 列表（多条记录可能共用一张图） */
+  const byImage = new Map<string, { sns: string[]; time: number }>()
+  for (const r of records) {
+    if (!r.imageId) continue
+    const entry = byImage.get(r.imageId) ?? { sns: [], time: r.time }
+    entry.sns.push(r.sn)
+    byImage.set(r.imageId, entry)
+  }
+
+  // 用到的图片一次性取出，按 imageId 去重。
+  // 不能逐条 getImageBlob：同一张照片常被多条记录引用（一图多码），
+  // 重复读 IndexedDB 不说，还会让 skipped 被重复计数 —— 两个 Sheet 各数一次，
+  // 于是「12 条中 14 条图片缺失」这种自相矛盾的数字会报给用户。
+  const neededIds = [...new Set(records.map((r) => r.imageId).filter((id): id is string => !!id))]
+  const blobs = new Map<string, Blob | null>()
+  for (const id of neededIds) blobs.set(id, await getImageBlob(id))
+
+  // skipped 的语义：**本该有图、但图片已经丢失**的记录数（每条记录至多计一次）。
+  // 完全没有 imageId 的记录不计入 —— 那是纯文字记录，不是图片丢失，
+  // 否则纯文字导出会每次都弹「12 条中 12 条图片缺失」。
   let skipped = 0
   const withImage: { rowIndex: number; imageId: string; sn: string }[] = []
 
@@ -2969,21 +2989,26 @@ export async function exportExcel(
     })
     // 行高按缩略图高度预留，图片才能完整显示
     ws.getRow(i + 2).height = pxToRowHeight(THUMB_MAX_H)
-    if (r.imageId) withImage.push({ rowIndex: i + 2, imageId: r.imageId, sn: r.sn })
+    if (r.imageId) {
+      if (blobs.get(r.imageId)) withImage.push({ rowIndex: i + 2, imageId: r.imageId, sn: r.sn })
+      else skipped++ // 图片已丢失：缩略图列留空，计入上报
+    }
   })
 
+  // 进度要覆盖两个 Sheet 的全部图片工作量。只在 Sheet 1 报进度的话，
+  // 进度条会停在 100% 而 Sheet 2 的原图还在慢慢编码 —— 那正是最慢的一段。
+  let done = 0
+  const totalWork = withImage.length + byImage.size
+
   // 缩略图嵌入（列 K = 第 11 列，下标 10）
-  for (let k = 0; k < withImage.length; k++) {
-    const item = withImage[k]
-    onProgress?.(k + 1, withImage.length)
-    const blob = await getImageBlob(item.imageId)
-    if (!blob) {
-      skipped++
-      continue
-    }
+  for (const item of withImage) {
+    done++
+    onProgress?.(done, totalWork)
+    const blob = blobs.get(item.imageId)
+    if (!blob) continue // 已在上面计入 skipped
     const thumb = await toJpegBase64(blob, THUMB_MAX_W, THUMB_MAX_H)
     if (!thumb) {
-      skipped++
+      skipped++ // blob 在但解码/编码失败：同样算这条记录没图上
       continue
     }
     const imageId = wb.addImage({ base64: thumb.base64, extension: 'jpeg' })
@@ -2998,27 +3023,14 @@ export async function exportExcel(
   const ws2 = wb.addWorksheet('原始图片')
   ws2.getColumn(1).width = 60
 
-  /** imageId → 该图登记到的 SN 列表（多条记录可能共用一张图） */
-  const byImage = new Map<string, { sns: string[]; time: number }>()
-  for (const r of records) {
-    if (!r.imageId) continue
-    const entry = byImage.get(r.imageId) ?? { sns: [], time: r.time }
-    entry.sns.push(r.sn)
-    byImage.set(r.imageId, entry)
-  }
-
   let rowCursor = 1
   for (const [imgId, entry] of byImage) {
-    const blob = await getImageBlob(imgId)
-    if (!blob) {
-      skipped++
-      continue
-    }
+    done++
+    onProgress?.(done, totalWork)
+    const blob = blobs.get(imgId)
+    if (!blob) continue // 已按记录计入 skipped，这里不再重复计
     const full = await toJpegBase64(blob, FULL_MAX_W, FULL_MAX_H)
-    if (!full) {
-      skipped++
-      continue
-    }
+    if (!full) continue
     const labelRow = ws2.getRow(rowCursor)
     labelRow.getCell(1).value = `${fmtTime(entry.time)}　共 ${entry.sns.length} 台：${entry.sns.join('、')}`
     labelRow.getCell(1).font = { bold: true }
@@ -3070,10 +3082,19 @@ Expected: `6 passed`。
   const header = '序号,SN序列号,IMEI1,IMEI2,MEID,EID,登记来源,验证状态,登记的条形码值,照片中全部条形码,OCR值,OCR原文,登记时间,图片文件名'
 ```
 
+顶部加导入：
+
+```ts
+import { imageFileName } from './exportExcel'
+```
+
 行数据末尾追加（`fmtTime(r.time)` 之后）：
 
 ```ts
-      cell(r.imageId ? `${String(i + 1).padStart(3, '0')}_${r.sn}.jpg` : ''),
+      // 复用 imageFileName，保证 CSV 里的文件名与 Excel 实际生成的那个逐字一致。
+      // 手写 `${i+1}_${r.sn}.jpg` 在 SN 含 / 或 : 时会被替换成下划线，
+      // 于是 CSV 指向一个 Excel 里并不存在的文件名，交叉引用就断了。
+      cell(r.imageId ? imageFileName(i + 1, r.sn) : ''),
 ```
 
 **Step 7: RecordsView 加导出按钮**
