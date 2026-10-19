@@ -3332,9 +3332,14 @@ export async function exportExcel(
       ext: { width: full.width, height: full.height },
       editAs: 'oneCell',
     })
-    // 预留图片占用的行数（每行 20px）
-    const rowsNeeded = Math.ceil(full.height / 20) + 1
-    for (let i = 0; i < rowsNeeded; i++) ws2.getRow(rowCursor + i).height = 20
+    // 预留图片占用的行数。**单位必须换算**：Excel 的行高单位是磅（pt），
+    // 而 full.height 是像素。1px = 0.75pt，所以 20px 的行高要写成 pxToRowHeight(20)=15，
+    // 不能直接写 20 —— 写 20 就是 20pt ≈ 26.7px，比预期的行高出 1/3，
+    // 于是 rowsNeeded 这个「够不够」的估算被系统性放大，每张原图后面都拖出
+    // 一大片空白（1200px 的图后面多留约 400px）。不影响正确性，但导出件很难看。
+    const ROW_PX = 20
+    const rowsNeeded = Math.ceil(full.height / ROW_PX) + 1
+    for (let i = 0; i < rowsNeeded; i++) ws2.getRow(rowCursor + i).height = pxToRowHeight(ROW_PX)
     rowCursor += rowsNeeded
   }
 
@@ -3470,7 +3475,11 @@ git commit -m "feat(export): Excel 导出，记录行嵌缩略图 + 原图页"
 npx vitest run
 ```
 
-Expected: 全部通过，**68 passed**（smoke 1 + imageStore 18 + store 7 + deviceBoxes 15 + multiRecognize 21 + exportExcel 6）。
+Expected: 全部通过，**70 passed**（smoke 1 + imageStore 18 + store 7 + deviceBoxes 15 + multiRecognize 23 + exportExcel 6）。
+
+> 勘误：原文写 68、且把 multiRecognize 记作 21。Task 7 修缺陷时补了 2 个用例，
+> 实际是 23；Task 9 之后实测总数 64，加上 exportExcel 的 6 个即 70。
+> 这条数字会随每次补测漂移，**以实际输出为准**，本条只是让你能判断「多出来的是不是我加的」。
 
 **Step 2: 逐条对照设计文档的验收标准**
 
