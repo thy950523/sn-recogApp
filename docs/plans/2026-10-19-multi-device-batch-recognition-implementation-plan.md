@@ -1221,7 +1221,7 @@ export function buildCandidates(
   lines: OcrLine[],
   barcodes: DetectedBarcode[],
 ): DeviceCandidate[] {
-  // ---- 1. 找出 S/N 锚点行（同一 SN 只保留最靠上的一行）----
+  // ---- 1. 找出 S/N 锚点行（同一 SN 只保留第一次出现的一行）----
   const anchors: { sn: string; box: Box4 }[] = []
   const seenSn = new Set<string>()
   for (const line of lines) {
@@ -1230,6 +1230,9 @@ export function buildCandidates(
     seenSn.add(sn)
     anchors.push({ sn, box: line.box })
   }
+  // 按中心 y 升序：assignByNearestY 的 tie-break 是「取下标较小」，
+  // 只有锚点有序时它才等价于「几何上靠上」；也顺带让条码归属不受输入顺序影响。
+  anchors.sort((a, b) => boxCenterY(a.box) - boxCenterY(b.box))
 
   const anchorBoxes = anchors.map((a) => a.box)
 
@@ -1780,7 +1783,28 @@ git commit -m "feat(ui): MultiResultView 骨架，原图叠加识别位置标注
 **Files:**
 - Modify: `src/sections/MultiResultView.tsx`
 
-**Step 1: 加候选行状态与勾选逻辑**
+**Step 1: 标注层改为跟随 `rows`（重要）**
+
+Task 8 的标注框渲染的是 `devices`（原始识别结果）。本步列表渲染的是 `rows`（用户可删行），
+两者必须同源：否则删掉一行后，画面上仍保留该设备的框、序号与 `activeIndex` 高亮全部错位。
+
+把标注层里的 `{devices.map((d, i) => (` 改为：
+
+```tsx
+          {rows.map((row, i) => {
+            const d = row.source
+            return (
+```
+
+（把原来的 `))}` 对应改成 `})}`；`d` 不再来自 `devices` 而来自 `row.source`。）
+
+同时把 header 里的台数改为跟随 `rows`：
+
+```tsx
+          批量识别&nbsp;/&nbsp;{result ? `${rows.length} 台` : '识别中'}
+```
+
+**Step 2: 加候选行状态与勾选逻辑**
 
 在组件内、`devices` 之后加入：
 
@@ -1788,11 +1812,17 @@ git commit -m "feat(ui): MultiResultView 骨架，原图叠加识别位置标注
   /** 每行的勾选状态与可编辑 SN；result 到位时初始化 */
   const [rows, setRows] = useState<{ sn: string; checked: boolean; source: DeviceCandidate }[]>([])
 
+  // existingSns 每次父组件渲染都可能是新数组。若直接放进初始化 effect 的依赖，
+  // 父组件任何一次重渲染都会把用户的勾选、编辑、删行全部重置。
+  // 用 ref 取最新值，只在 result 变化时初始化一次。
+  const existingRef = useRef(existingSns)
+  existingRef.current = existingSns
+
   useEffect(() => {
     if (!result) return
     setRows(
       result.devices.map((d) => {
-        const dup = existingSns.includes(d.sn)
+        const dup = existingRef.current.includes(d.sn)
         return {
           sn: d.sn,
           // 默认勾选；与已有记录重复的默认不勾，避免误登记
@@ -1801,7 +1831,7 @@ git commit -m "feat(ui): MultiResultView 骨架，原图叠加识别位置标注
         }
       }),
     )
-  }, [result, existingSns])
+  }, [result])
 
   const checkedCount = rows.filter((r) => r.checked && r.sn.trim()).length
 
@@ -1826,7 +1856,7 @@ git commit -m "feat(ui): MultiResultView 骨架，原图叠加识别位置标注
         verified: r.source.status === 'match' && r.source.barcode === r.sn,
         barcode: r.source.barcode,
         barcodes: r.source.barcodes,
-        ocr: r.source.status === 'ocr_only' ? r.source.sn : null,
+        ocr: r.source.status === 'match' || r.source.status === 'ocr_only' ? r.source.sn : null,
         imei: r.source.imei,
         imei2: r.source.imei2,
         meid: r.source.meid,
@@ -1838,7 +1868,7 @@ git commit -m "feat(ui): MultiResultView 骨架，原图叠加识别位置标注
   }
 ```
 
-**Step 2: 渲染候选列表与底部按钮**
+**Step 3: 渲染候选列表与底部按钮**
 
 把 `{/* 候选列表在 Task 9 实现 */}` 替换为：
 
@@ -1937,7 +1967,7 @@ git commit -m "feat(ui): MultiResultView 骨架，原图叠加识别位置标注
       </footer>
 ```
 
-**Step 3: 类型检查与 lint**
+**Step 4: 类型检查与 lint**
 
 ```bash
 npx tsc -b && npm run lint
