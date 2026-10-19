@@ -16,7 +16,10 @@ const bar = (value: string, y0: number, y1: number): { value: string; box: Box4 
 
 describe('snFromLine', () => {
   it('优先取 S/N 标记后的值', () => {
-    expect(snFromLine('S/N: 8A7C2D1E')).toBe('8A7C2D1E')
+    // 必须用 6 位的短 SN：兜底的 extractSnCandidates 要求 8 位以上，取不到它，
+    // 于是这条只有走「标记优先」分支才能通过。若写 'S/N: 8A7C2D1E'，
+    // 两条路径同值，把标记分支整段删掉这条仍然绿 —— 等于没测。
+    expect(snFromLine('S/N: A1B2C3')).toBe('A1B2C3')
   })
   it('无标记时取疑似 SN 的字母数字混合串', () => {
     expect(snFromLine('8A7C2D1E9F')).toBe('8A7C2D1E9F')
@@ -79,8 +82,14 @@ describe('buildCandidates', () => {
     const lines = [line('S/N: 8A7C2D1E', 0.10, 0.14), line('S/N: 9B8D3E2F', 0.30, 0.34)]
     const barcodes = [bar('9B8D3E2F', 0.24, 0.28)]
     const devices = buildCandidates(lines, barcodes)
+    // 必须断言条数与 status：只断言 barcode 的话，当阈值被改小、条码谁也没认领、
+    // 另起一条 barcode_only 时，那条候选按 y 排序恰好落到 devices[1]，
+    // barcode 断言照样通过（假绿）。status 才区分「锚点认领」与「补出来的候选」。
+    expect(devices).toHaveLength(2)
     expect(devices[0].barcode).toBeNull()
+    expect(devices[0].status).toBe('ocr_only')
     expect(devices[1].barcode).toBe('9B8D3E2F')
+    expect(devices[1].status).toBe('match')
   })
 
   it('没有任何条码时，S/N 行仍各成一条 ocr_only', () => {
