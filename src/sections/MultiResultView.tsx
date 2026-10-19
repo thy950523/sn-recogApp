@@ -70,6 +70,19 @@ export default function MultiResultView({ image, onRetake }: Props) {
   // 于是它自己的判定有效、结果照常落地，同时 OCR 只跑一遍。
   const inflightRef = useRef<{ url: string; promise: Promise<MultiRecognizeResult> } | null>(null)
 
+  // 本组件的约定：**一张图一个实例**。调用方换图时必须换 `key`（Task 10 传的是
+  // `key={screen.key}`，每次拍照都新建），靠重挂载清空全部状态。
+  //
+  // 于是 `image.dataUrl` 这个依赖项与 urlRef 判定在本工程里是**防御性**的，
+  // 它们只覆盖 StrictMode 的同图二次运行，并不真正支持「同一实例内原地换图」。
+  // 原地换图会有两个已知漏洞（B-6 / B-7，已记入计划「已知风险」）：
+  //   B-6 换图时没有清 result/failed/stage —— 新图会顶着旧图的结果且没有转圈遮罩，
+  //       甚至出现 failed 与旧 result 并存（两种提示同时显示）。
+  //   B-7 urlRef 在 effect 里更新，而 effect 在 commit 之后才跑；promise 的 .then
+  //       是微任务，可能插在「commit 完成」与「effect 刷新」之间，此时 urlRef 还是旧值，
+  //       旧图的结果会被误判为「仍属于当前图」而落地。
+  // 若将来真要支持原地换图，必须同时补两处：在 effect 开头清 result/failed/stage，
+  // 并把判据从 urlRef 换成 render 期就确定的代次令牌 —— 只补 B-6 会让 B-7 显形。
   useEffect(() => {
     aliveRef.current = true
     const url = image.dataUrl
@@ -140,6 +153,12 @@ export default function MultiResultView({ image, onRetake }: Props) {
 
       {/* 原图 + 标注层 */}
       <div className="relative mx-4 border border-[#1f1f1f] bg-[#0a0a0a]">
+        {/* 外层 w-fit + 内层 max-h + max-w-full 三者缺一不可，**不要**简化。
+            实测 375×667、9:16 竖图：只给 max-w-full 时图片高达 ~590px，把下面的
+            候选列表挤到只剩 0.7px，等于没有列表。
+            为什么不改用 `object-contain`（更直觉的写法）：那会让 <img> 的**盒子**
+            比实际渲染出来的画面大，而标注层是按 <img> 的盒子定位的百分比 ——
+            框会整体错位。max-h 是让盒子本身变小，标注层才跟着对齐。 */}
         <div className="relative mx-auto w-fit">
           <img src={image.dataUrl} alt="拍摄照片" className="block max-h-[40dvh] max-w-full" />
           {/* 标注层：归一化坐标直接换算成百分比，无需知道显示尺寸 */}

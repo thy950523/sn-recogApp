@@ -3453,5 +3453,6 @@ superpowers:finishing-a-development-branch 决定合并方式。
 | exceljs 与 Vite 的兼容问题（`default` 导出形式） | 代码里已做 `mod.default ?? mod` 兼容；若仍失败，在 `vite.config.ts` 加 `optimizeDeps.include: ['exceljs']` |
 | **本地 OCR 的共享 worker 竞态**：`preloadOcr()` 返回被缓存复用的**同一个** tesseract worker，而 `setParameters` 与 `recognize` 是两条独立消息、worker 不串行化。两个 OCR 流程**并发**时 `pageseg_mode` 会互相覆盖（实测：并发两次 `setParameters` 落在同一份全局状态上） | **既有架构问题，非本次引入** —— 两次并发 `recognizeSn` 之间同样存在，`recognizeMulti` 只是第三个使用者。Task 7 已显式设 `PSM.SPARSE_TEXT`，解决了**顺序**调用；并发需要给共享 worker 加串行化（队列/互斥），属独立改动，会碰核心识别文件，本次不做。影响是「结果可见地变差但原因不可见」，非静默 |
 | `decodeAllBarcodes` 第 1 轮只要读到 ≥1 个条码就直接返回，不再做增强/旋转轮 | 既有行为。一图多码里若一个条码清晰、另一个偏淡，后者永远读不到 → 少识别一台设备。属识别率问题而非正确性问题（少的那台不会以错误数据出现），本次不动 |
+| **`MultiResultView` 的识别 effect 不支持「同一实例内原地换图」**（B-6 / B-7，Task 8 复审发现）：① 换图时没有清 `result`/`failed`/`stage`，新图会顶着旧图的结果且无转圈遮罩，`failed` 还能与旧 `result` 并存；② `urlRef` 在 effect 里更新而 effect 晚于 commit，promise 的 `.then` 是微任务、可能插在 commit 与 effect 刷新之间，此时旧图结果会被误判为「仍属当前图」而落地 | **当前不可达**：Task 10 用 `key={screen.key}`（每次拍照新建）渲染，换图必然重挂载，实例状态归零。两个漏洞都只影响「原地换图」这条不存在的路径。已在 `MultiResultView` 里写明约定（一图一实例），并注明若将来要支持原地换图必须**同时**补：effect 开头清三个 state + 把判据换成 render 期确定的代次令牌（只补前者会让 B-7 显形） |
 | 缩略图嵌在单元格里，Excel 行高不够会显示不全 | 行高按 `THUMB_MAX_H` 折算设置；导出后需人工抽查一次 |
 | 大量记录导出时内存占用高 | 已加进度提示；超过 200 条时可在界面上提示分批导出 |
