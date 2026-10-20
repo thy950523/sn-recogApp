@@ -5,7 +5,9 @@ import {
   imageFileName,
   labelColumns,
   labelValue,
-  photoPlacement,
+  PHOTO_COL_PX,
+  photoCell,
+  writePhotoCell,
 } from './exportExcel'
 import type { SnRecord } from '@/types'
 
@@ -66,10 +68,9 @@ describe('excelImageExtension', () => {
   })
 })
 
-describe('photoPlacement', () => {
-  // 一条肉眼看不见、但一改就出错的约束：锚点偏移是**单元格尺寸的百分比**，
-  // 而单元格尺寸随图片宽高比变化。原来的 0.1 / 0.05 在小缩略图上没事，
-  // 换成 480px 高的竖图就会把图片底边顶出格子 —— 表里看着就是照片糊到了下一行。
+describe('photoCell', () => {
+  // 照片嵌在格子里、按格子自适应，所以两条约束都是肉眼看不见、一改就出错的：
+  // 行高不够 → 照片被压成一条缝；行高超限 → 被 Excel 静默截断。两头都不报错，只是难看。
   const cases: [number, number, string][] = [
     [1200, 900, '横图'],
     [900, 1500, '竖图'],
@@ -78,32 +79,58 @@ describe('photoPlacement', () => {
     [200, 150, '本来就比上限小的图'],
   ]
 
-  it('图片连同偏移都落在单元格内', () => {
+  it('行高撑得住照片（照片按格子自适应，格子不够高就看不全）', () => {
     for (const [w, h, label] of cases) {
-      const p = photoPlacement(w, h)!
+      const p = photoCell(w, h)!
       const rowPx = p.rowHeightPt / 0.75
-      expect(p.colOffset * p.colWidthPx + p.width, `${label} 超出列宽`).toBeLessThanOrEqual(
-        p.colWidthPx,
-      )
-      expect(p.rowOffset * rowPx + p.height, `${label} 超出行高`).toBeLessThanOrEqual(rowPx)
+      expect(rowPx, `${label} 行高装不下照片`).toBeGreaterThanOrEqual(p.photoHeight)
+      expect(PHOTO_COL_PX, `${label} 列宽装不下照片`).toBeGreaterThanOrEqual(p.photoWidth)
     }
   })
 
   it('不放大：原图比上限小时按原尺寸摆（不为了填满单元格而拉大）', () => {
-    const p = photoPlacement(200, 150)!
-    expect({ width: p.width, height: p.height }).toEqual({ width: 200, height: 150 })
+    const p = photoCell(200, 150)!
+    expect({ width: p.photoWidth, height: p.photoHeight }).toEqual({ width: 200, height: 150 })
+  })
+
+  it('保持宽高比', () => {
+    const p = photoCell(1080, 1920)!
+    expect(p.photoWidth / p.photoHeight).toBeCloseTo(1080 / 1920, 2)
   })
 
   it('行高不超过 Excel 的上限 409.5 磅', () => {
     // 超了行高会被 Excel 静默截断，图片下半截被压住 —— 不报错，只是难看。
     for (const [w, h, label] of cases) {
-      expect(photoPlacement(w, h)!.rowHeightPt, `${label} 行高超限`).toBeLessThanOrEqual(409.5)
+      expect(photoCell(w, h)!.rowHeightPt, `${label} 行高超限`).toBeLessThanOrEqual(409.5)
     }
   })
 
   it('宽高有 0（图片损坏）时返回 null，不产生 NaN 行高', () => {
-    expect(photoPlacement(0, 100)).toBeNull()
-    expect(photoPlacement(100, 0)).toBeNull()
+    expect(photoCell(0, 100)).toBeNull()
+    expect(photoCell(100, 0)).toBeNull()
+  })
+})
+
+describe('writePhotoCell', () => {
+  // 回归测试。exceljs 的 `getCell(row, col)` 是**行在前、列在后**，写反了它不报错，
+  // 只会把照片静默写到别的格子里 —— 实测真实 App 导出时照片全跑到 B13、C13、D13，
+  // 界面还照报「已导出 4 条」，照片列却整列空白。
+  it('写到指定的行与列，不动别的格子', async () => {
+    const mod = await import('exceljs')
+    const ExcelJS = (mod as unknown as { default?: typeof import('exceljs') }).default ?? mod
+    const wb = new ExcelJS.Workbook()
+    const ws = wb.addWorksheet('S')
+    ws.columns = Array.from({ length: 13 }, (_, i) => ({ header: `c${i + 1}`, key: `c${i + 1}` }))
+    ws.addRow({})
+
+    const id = 'ID_ABCDEF0123456789ABCDEF0123456789'
+    writePhotoCell(ws, 2, 13, id)
+
+    expect(ws.getCell('M2').value).toMatchObject({
+      formula: `_xlfn.DISPIMG("${id}",1)`,
+      result: `=DISPIMG("${id}",1)`,
+    })
+    expect(ws.getCell('B13').value).toBeNull()
   })
 })
 
