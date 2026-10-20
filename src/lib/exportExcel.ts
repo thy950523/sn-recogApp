@@ -12,6 +12,9 @@
  * 默认使用精简 JPEG，支持清晰、原图、仅文字模式；裁剪在导出时从原图生成。
  * 原始图片仍完整保留在 IndexedDB，压缩结果不覆盖原图。
  *
+ * 照片格子的行高列宽是**统一**的（PHOTO_BOX_PX），照片按格子自适应显示成缩略图：
+ * 表格才不会被一张竖图撑成一屏两行。表头 14 磅、数据 12 磅（默认 11 磅偏小）。
+ *
  * 同一张照片被多条记录引用时（一图多码），`xl/media/` 里**只存一份**，多个单元格
  * 引用同一个 ID。WPS 自己也是这么做的 —— 样本文件里就有同一个 ID 被两个单元格引用。
  *
@@ -26,19 +29,29 @@ import type { Box4 } from './deviceBoxes'
 import { addCellImages, dispImgFormula, newCellImageId, type CellImagePart } from './wpsCellImages'
 
 /**
- * 照片格子里图片的**显示**尺寸上限（像素）。
+ * 照片在格子里**默认**显示多大（像素）—— 定的是格子本身，不是图片。
  *
- * 360 宽是「表格还能上下浏览」与「照片看得清」之间的折中。照片嵌在格子里，
- * 显示多大由**行高列宽**决定，这里定的是我们打算给它多大地方。
+ * 照片嵌在格子里、按格子自适应，所以显示大小只由**行高列宽**决定。格子取近正方形
+ * （列比行略宽 20px），于是竖图约 96×128、横图约 140×79。
  *
- * 高度上限 480 是给竖图留的（360×480 = 4:3 竖幅）。**不要**调过 546：
- * Excel 的行高上限是 409.5 磅 = 546px，超了行高会被静默截断，图片下半截被压住。
+ * 120 是「一屏能看十几行」与「缩略图还认得出是张照片」之间的折中。要看细节靠 WPS 里
+ * 放大看图 —— 媒体字节本身是高清的（精简 1280px / 清晰 2400px / 原图全分辨率），
+ * 不受这里影响，所以缩略图小不等于图片糊。
+ */
+export const PHOTO_BOX_PX = 120
+
+/**
+ * 写进 `xl/cellimages.xml` 的**声明**尺寸上限（像素）。
+ *
+ * 这个值**不控制显示大小**（WPS 按单元格自适应，见 wpsCellImages.ts），只要求跟原图
+ * 等比。留得比格子大是有意的：万一哪条路径（转成浮动图片、另存为图片）认它，拿到的是
+ * 大图而不是缩略图的尺寸。上限本身的意义只是别把 4000px 的原始尺寸原样写进去。
  */
 const PHOTO_MAX_W = 360
 const PHOTO_MAX_H = 480
 
 /**
- * 照片列比图片本身多留的余量（像素）与行高余量（磅）。
+ * 照片列比格子多留的余量（像素）与行高余量（磅）。
  *
  * 必须留：格子比照片略大，照片才不会被行列边界挤得贴边。
  */
@@ -46,7 +59,24 @@ const PHOTO_COL_PAD_PX = 20
 const PHOTO_ROW_PAD_PT = 6
 
 /** 照片列的列宽（像素） */
-export const PHOTO_COL_PX = PHOTO_MAX_W + PHOTO_COL_PAD_PX
+export const PHOTO_COL_PX = PHOTO_BOX_PX + PHOTO_COL_PAD_PX
+
+/**
+ * 字体名：改字号时**必须连它一起给**。
+ *
+ * exceljs 的 `<font>` 只写你显式给过的属性，只给 size 会产出 `<font><sz val="12"/></font>`
+ * —— 没有 `<name>`，等于把「用哪个字体」交给阅读器去猜。数据格原本用的是工作簿默认的
+ * Calibri，这里显式写回来，保证这次改动**只是字号变大**，字形一点没动。
+ */
+const FONT_NAME = 'Calibri'
+/** 表头字号（磅）。默认 11 磅偏小，列名要一眼能读 */
+const HEADER_FONT_PT = 14
+/** 数据行字号（磅）：比表头小一号，层级一眼分得开 */
+const DATA_FONT_PT = 12
+/** 表头行高（磅）：14 磅字要留余量，不然被行高切掉一截 */
+const HEADER_ROW_HEIGHT_PT = 30
+/** 没有照片的行（纯文字导出、图片已丢失）的行高（磅）：12 磅字在 15 磅的默认行高里贴边 */
+const TEXT_ROW_HEIGHT_PT = 20
 
 /** 等比缩放到不超过 maxW/maxH，不放大 */
 export function fitSize(
@@ -63,17 +93,17 @@ export function fitSize(
 }
 
 /**
- * 一张照片需要的格子尺寸。
+ * 一个照片格子：**声明尺寸**（写进 cellimages.xml）+ 该行的行高。
  *
- * 抽成纯函数是为了能测那条肉眼看不见、但一改就出错的约束：**行高必须撑得住照片**。
- * 照片嵌在格子里、按格子自适应，行高不够它就只剩一条缝；行高超了 409.5 磅又会被
- * Excel 静默截断。两头都不报错，只是难看。
+ * 抽成纯函数是为了能测那两条肉眼看不见、但一改就出错的约束：格子要装得下照片
+ * （装不下照片就被挤成一条缝），行高又不能超 Excel 的 409.5 磅上限（超了被静默截断）。
+ * 两头都不报错，只是难看。
  */
 export interface PhotoCell {
-  /** 照片显示尺寸（px）：写进 cellimages.xml 的 a:ext */
+  /** 声明尺寸（px）：写进 cellimages.xml 的 a:ext，**不是显示尺寸** */
   photoWidth: number
   photoHeight: number
-  /** 该行的行高（磅） */
+  /** 该行的行高（磅）。所有照片行同一个值：格子一样大，表格才整齐 */
   rowHeightPt: number
 }
 
@@ -83,7 +113,10 @@ export function photoCell(srcWidth: number, srcHeight: number): PhotoCell | null
   return {
     photoWidth: size.width,
     photoHeight: size.height,
-    rowHeightPt: pxToRowHeight(size.height) + PHOTO_ROW_PAD_PT,
+    // 行高与照片宽高比无关：格子是固定的，照片自己按格子缩放。这里仍然只算一次，
+    // 是因为「图片坏了（宽或高为 0）就返回 null、不写这个格子」这条判定必须留着 ——
+    // 否则一条坏记录会让整批导出挂掉。
+    rowHeightPt: pxToRowHeight(PHOTO_BOX_PX) + PHOTO_ROW_PAD_PT,
   }
 }
 
@@ -244,8 +277,8 @@ export async function exportExcel(
     ...labels.map((k) => ({ header: k, key: `label:${k}`, width: 18 })),
     ...TAIL_HEAD,
   ]
-  ws.getRow(1).font = { bold: true }
-  ws.getRow(1).height = 20
+  ws.getRow(1).font = { bold: true, size: HEADER_FONT_PT, name: FONT_NAME }
+  ws.getRow(1).height = HEADER_ROW_HEIGHT_PT
 
   /** 「照片」列的 1 基下标 —— 标签列数量可变，写死下标会在有标签字段时错位 */
   const photoCol = FIXED_HEAD.length + labels.length + 3
@@ -280,9 +313,14 @@ export async function exportExcel(
       file: fileName,
     }
     for (const k of labels) row[`label:${k}`] = labelValue(r, k)
-    ws.addRow(row)
-    // 行高与 DISPIMG 公式**都不在这里**写：照片的格子尺寸取决于它自己的宽高比
-    // （竖图 480px、横图 270px），要等下面拿到图片尺寸才知道。这里只登记待办。
+    const added = ws.addRow(row)
+    // 字号与行高跟着行走。这里先给一个「没有照片」的基准：纯文字导出、图片丢失的行
+    // 就停在这个高度；有照片的行会在下面按照片格覆盖成更高。
+    // 字号现在设也来得及 —— 照片格是后面才 getCell 出来的，而 exceljs 新建单元格时会
+    // 继承所在行的 style（见 cell.js 构造函数里的 _mergeStyle）。
+    added.font = { size: DATA_FONT_PT, name: FONT_NAME }
+    added.height = TEXT_ROW_HEIGHT_PT
+    // DISPIMG 公式**不在这里**写：得等下面拿到图片、生成 ID 才知道写什么。这里只登记待办。
     if (r.imageId && mode !== 'text') {
       if (images.get(r.imageId)) withImage.push({ rowIndex: i + 2, imageId: r.imageId, fileName, crop: r.photoCrop })
       else skipped++ // 图片已丢失：照片列留空，计入上报
@@ -327,7 +365,7 @@ export async function exportExcel(
       })
     }
 
-    // 行高必须按这张照片的显示高度给：照片嵌在格子里、按格子自适应，
+    // 行高按格子给（所有照片行同一个值）：照片嵌在格子里、按格子自适应，
     // 行高不够它就被压成一条缝。单位换算见 pxToRowHeight：Excel 行高是磅，1px = 0.75pt。
     ws.getRow(item.rowIndex).height = hit.cell.rowHeightPt
     // 公式走 exceljs 正常写：exceljs 对「结果是字符串的公式」正好产出

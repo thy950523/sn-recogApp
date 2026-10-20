@@ -5,6 +5,7 @@ import {
   imageFileName,
   labelColumns,
   labelValue,
+  PHOTO_BOX_PX,
   PHOTO_COL_PX,
   photoCell,
   writePhotoCell,
@@ -70,39 +71,41 @@ describe('excelImageExtension', () => {
 
 describe('photoCell', () => {
   // 照片嵌在格子里、按格子自适应，所以两条约束都是肉眼看不见、一改就出错的：
-  // 行高不够 → 照片被压成一条缝；行高超限 → 被 Excel 静默截断。两头都不报错，只是难看。
+  // 格子不够大 → 照片被压成一条缝；行高超限 → 被 Excel 静默截断。两头都不报错，只是难看。
   const cases: [number, number, string][] = [
     [1200, 900, '横图'],
     [900, 1500, '竖图'],
     [1600, 1200, '4:3'],
     [1080, 1920, '9:16'],
-    [200, 150, '本来就比上限小的图'],
+    [4000, 500, '全景（极端宽）'],
+    [500, 4000, '长图（极端高）'],
+    [200, 150, '本来就比盒子小的图'],
   ]
 
-  it('行高撑得住照片（照片按格子自适应，格子不够高就看不全）', () => {
+  it('格子装得下照片（照片按盒子缩放后不超出列宽与行高）', () => {
     for (const [w, h, label] of cases) {
+      const shown = fitSize(w, h, PHOTO_BOX_PX, PHOTO_BOX_PX)
       const p = photoCell(w, h)!
-      const rowPx = p.rowHeightPt / 0.75
-      expect(rowPx, `${label} 行高装不下照片`).toBeGreaterThanOrEqual(p.photoHeight)
-      expect(PHOTO_COL_PX, `${label} 列宽装不下照片`).toBeGreaterThanOrEqual(p.photoWidth)
+      expect(PHOTO_COL_PX, `${label} 列宽装不下照片`).toBeGreaterThanOrEqual(shown.width)
+      expect(p.rowHeightPt / 0.75, `${label} 行高装不下照片`).toBeGreaterThanOrEqual(shown.height)
     }
   })
 
-  it('不放大：原图比上限小时按原尺寸摆（不为了填满单元格而拉大）', () => {
+  it('行高统一：不随照片宽高比变（一张竖图不该把整行撑高）', () => {
+    const heights = cases.map(([w, h]) => photoCell(w, h)!.rowHeightPt)
+    expect(new Set(heights).size).toBe(1)
+    // 超了会被 Excel 静默截断，图片下半截被压住 —— 不报错，只是难看。
+    expect(heights[0]).toBeLessThanOrEqual(409.5)
+  })
+
+  it('声明尺寸（a:ext）不放大：原图比上限小时按原尺寸摆', () => {
     const p = photoCell(200, 150)!
     expect({ width: p.photoWidth, height: p.photoHeight }).toEqual({ width: 200, height: 150 })
   })
 
-  it('保持宽高比', () => {
+  it('声明尺寸（a:ext）保持宽高比', () => {
     const p = photoCell(1080, 1920)!
     expect(p.photoWidth / p.photoHeight).toBeCloseTo(1080 / 1920, 2)
-  })
-
-  it('行高不超过 Excel 的上限 409.5 磅', () => {
-    // 超了行高会被 Excel 静默截断，图片下半截被压住 —— 不报错，只是难看。
-    for (const [w, h, label] of cases) {
-      expect(photoCell(w, h)!.rowHeightPt, `${label} 行高超限`).toBeLessThanOrEqual(409.5)
-    }
   })
 
   it('宽高有 0（图片损坏）时返回 null，不产生 NaN 行高', () => {
