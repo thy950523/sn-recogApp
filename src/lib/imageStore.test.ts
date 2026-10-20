@@ -2,26 +2,66 @@ import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   clearAll,
+  dataUrlToBlob,
   deleteImages,
   estimateUsage,
+  getImage,
   getImageBlob,
   getImageUrl,
   putImage,
   releaseImageUrl,
-  scaleToMaxEdge,
+  saveDataUrlImage,
 } from './imageStore'
 
 const jpeg = () => new Blob([new Uint8Array([1, 2, 3, 4, 5])], { type: 'image/jpeg' })
 
-describe('scaleToMaxEdge', () => {
-  it('最长边超出上限时等比缩小', () => {
-    expect(scaleToMaxEdge(3200, 2400, 1280)).toEqual({ width: 1280, height: 960 })
+describe('dataUrlToBlob', () => {
+  it('解出与原始字节完全相同的 Blob（存图不做二次编码的前提）', async () => {
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46])
+    const base64 = btoa(String.fromCharCode(...bytes))
+    const blob = dataUrlToBlob(`data:image/jpeg;base64,${base64}`)
+    expect(blob.type).toBe('image/jpeg')
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(bytes)
   })
-  it('最长边未超上限时保持原尺寸', () => {
-    expect(scaleToMaxEdge(800, 600, 1280)).toEqual({ width: 800, height: 600 })
+
+  it('按 base64 标记大小写不敏感地识别', async () => {
+    // encodePayload 产出的是小写 `;base64`，但大小写不该改变语义
+    const blob = dataUrlToBlob('data:image/jpeg;BASE64,AQID')
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]))
   })
-  it('竖图按高缩小', () => {
-    expect(scaleToMaxEdge(1080, 1920, 960)).toEqual({ width: 540, height: 960 })
+
+  it('非 base64 的 data URL 按百分号编码解，不是当成 base64 硬解', () => {
+    expect(dataUrlToBlob('data:text/plain,hello%20world').type).toBe('text/plain')
+  })
+
+  it('缺 MIME 时给中性兜底，不留空串（空 MIME 会让导出侧无从判断类型）', () => {
+    expect(dataUrlToBlob('data:,AQID').type).toBe('application/octet-stream')
+  })
+
+  it('不是 data URL 时抛出，不静默返回一个空 Blob', () => {
+    // 静默存一个空图，用户要到导出时才发现照片全没了
+    expect(() => dataUrlToBlob('http://example.com/a.jpg')).toThrow()
+  })
+})
+
+describe('saveDataUrlImage', () => {
+  beforeEach(async () => {
+    await clearAll()
+  })
+
+  it('存进去的字节与载荷原始字节一致，且尺寸按传入值记下', async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7])
+    const base64 = btoa(String.fromCharCode(...bytes))
+    const id = await saveDataUrlImage(`data:image/jpeg;base64,${base64}`, 1600, 1200)
+
+    const stored = await getImage(id)
+    expect(stored).not.toBeNull()
+    expect(new Uint8Array(await stored!.blob.arrayBuffer())).toEqual(bytes)
+    expect({ width: stored!.width, height: stored!.height }).toEqual({ width: 1600, height: 1200 })
+  })
+
+  it('载荷非法时 reject，不留下半条记录', async () => {
+    await expect(saveDataUrlImage('not-a-data-url', 10, 10)).rejects.toThrow()
   })
 })
 

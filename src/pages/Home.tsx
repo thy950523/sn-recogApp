@@ -5,12 +5,19 @@ import type { ImagePayload } from '@/sections/MultiResultView'
 import RecordsView from '@/sections/RecordsView'
 import ContinuousScanView from '@/sections/ContinuousScanView'
 import { useRecords } from '@/lib/store'
-import { saveCanvasImage } from '@/lib/imageStore'
+import { deleteImages, putImage, saveDataUrlImage } from '@/lib/imageStore'
 import type { SnRecord } from '@/types'
 
 type Screen =
   | { name: 'scan' }
-  | { name: 'multi'; image: ImagePayload; key: number; imageId: string | null }
+  | {
+      name: 'multi'
+      image: ImagePayload
+      key: number
+      imageId: string | null
+      /** 照片仍在往 IndexedDB 里写（写完后 imageId 才有值） */
+      imageSaving: boolean
+    }
   | { name: 'records' }
   | { name: 'continuous' }
 
@@ -25,14 +32,21 @@ export default function Home() {
   // 登记错的 SN。单调自增序号保证每次拍照 key 必不相同。
   const shotSeq = useRef(0)
   /**
-   * 拍照/导入后：先尽量把图片存进 IndexedDB，再进识别页。
-   * 存图失败（配额满等）不能让流程中断 —— 记录照样能登记，只是没有图。
+   * 拍照/导入后：**立刻**切进识别页，存图在后台并行进行。
    *
-   * 为什么必须加 savingRef 锁：本函数改成 async 后，存图期间 ScanView 还没卸载，
-   * 快门按钮仍然可点（handleShutter 只检查 videoRef，而 stopCamera 后 videoRef 仍在，
-   * 再点一次会抓到最后那一帧的副本）。第二次点击会再存一张图，而它对应的 screen
-   * 会被后一次 setScreen 覆盖 —— 那张图的 imageId 永远不会被任何记录引用，
-   * 成为只占空间、只能靠「清空全部」才能回收的孤儿图。
+   * 为什么不等存完再切屏：存图（解码 + 编码 + 写 IndexedDB）在手机上要几百毫秒，
+   * 而这段时间相机已经停了、ScanView 还挂在屏幕上 —— 界面完全冻住、没有任何反馈，
+   * 正是用户报的「拍照后卡顿」。改成先切屏之后，照片立刻可见、OCR 立刻开跑，
+   * 落盘与识别重叠进行，等待态也直接复用识别页已有的转圈遮罩。
+   *
+   * 代价是进识别页时 imageId 还没有值，所以多一个 imageSaving 状态：
+   * 它期间登记按钮必须置灰（否则会写进一条没有 imageId 的记录，且用户当场察觉不到）。
+   *
+   * 为什么必须加 savingRef 锁：切屏虽是同步的，但 React 要等到本次 commit 之后
+   * 才把 ScanView 换掉，那一帧里旧 DOM 上的快门仍可点（handleShutter 只检查 videoRef，
+   * 而 stopCamera 后 videoRef 仍在，再点一次会抓到最后那一帧的副本）。第二次点击会
+   * 再存一张图，而它对应的 screen 会被后一次 setScreen 覆盖 —— 那张图的 imageId
+   * 永远不会被任何记录引用，成为只占空间、只能靠「清空全部」才能回收的孤儿图。
    *
    * **锁的释放点同样关键：必须放回 false，否则相机就废了。**
    * Home 组件在切屏时**不会卸载**（它只是换了 return 的 JSX），所以 savingRef 会
@@ -45,42 +59,60 @@ export default function Home() {
    * 把锁持有到离开识别页为止，这个窗口就完全不存在了。
    */
   const savingRef = useRef(false)
-  const handleShot = useCallback(async (image: ImagePayload) => {
+  /**
+   * 当前识别屏对应的拍照序号；离开识别屏后置 null。
+   *
+   * 只靠 setScreen 的 `prev.key === key` 守卫能防止**界面**被过期结果污染，
+   * 但拦不住**图片**：先切屏、后落盘这个顺序本身就是新的孤儿图来路 ——
+   * 用户完全可以在落盘那几百毫秒内点「重拍」，此时图片已经写进 IndexedDB，
+   * 却没有任何记录会引用它，只能靠「清空全部」才能回收。
+   * 这个 ref 让落盘回调能判断「这张图还有人要吗」，没人要就当场删掉。
+   */
+  const activeShotRef = useRef<number | null>(null)
+
+  const handleShot = useCallback((image: ImagePayload) => {
     if (savingRef.current) return
     savingRef.current = true
-    let imageId: string | null = null
-    try {
-      const canvas = document.createElement('canvas')
-      canvas.width = image.width
-      canvas.height = image.height
-      const img = new Image()
-      await new Promise<void>((resolve, reject) => {
-        img.onload = () => resolve()
-        img.onerror = () => reject(new Error('图片解码失败'))
-        img.src = image.dataUrl
-      })
-      // 不用非空断言 `getContext('2d')!`：它抛出的 TypeError 没有上下文，
-      // catch 里 warn 出来只是个光秃秃的 TypeError，看不出「为什么失败」。
-      // 显式检查并抛说明性错误，行为等价（原本也会抛、也被同一个 catch 接住）。
-      const ctx = canvas.getContext('2d')
-      if (!ctx) throw new Error('无法创建画布上下文')
-      // 显式给出目标宽高，不要写成 drawImage(img, 0, 0)。
-      // 眼下两者恰好相等（dataUrl 正是从 image.width×image.height 的画布导出的，
-      // 解码回来还是同样大小），所以 drawImage(img,0,0) 现在是 1:1 拷贝、看不出问题。
-      // 但一旦哪天载荷改成传原图 dataUrl，drawImage(img,0,0) 会按**原图**尺寸绘制、
-      // 超出画布的部分被静默裁掉 —— 存下来的是照片左上角一块，且不报错。
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
-      imageId = await saveCanvasImage(canvas)
-    } catch (e) {
-      console.warn('[image] 保存失败，本次登记将不带图片:', e)
-    }
-    setScreen({ name: 'multi', image, key: ++shotSeq.current, imageId })
+    const key = ++shotSeq.current
+    activeShotRef.current = key
+    setScreen({ name: 'multi', image, key, imageId: null, imageSaving: true })
+
+    // 落盘结果必须按 key 比对后再落地：这期间用户可能已经重拍、登记或退回拍照页，
+    // 过期结果一旦无条件 setScreen，就会把新屏的 imageId 覆盖成上一张图的
+    // （照片与记录张冠李戴），或把一个已经不存在的 multi 屏又拽回来。
+    const settle = (imageId: string | null) =>
+      setScreen((prev) =>
+        prev.name === 'multi' && prev.key === key ? { ...prev, imageId, imageSaving: false } : prev,
+      )
+
+    const save = image.blob
+      ? putImage(image.blob, image.width, image.height)
+      : saveDataUrlImage(image.dataUrl, image.width, image.height)
+    save.then(
+      (imageId) => {
+        if (activeShotRef.current !== key) {
+          // 屏已经切走了：这张图不会有任何记录引用它。删掉而不是留着 ——
+          // 孤儿图只占空间，且用户看不到它、也没法单独清理。
+          // 不 await：这是清理，失败也只是留下一张孤儿图，不该影响拍照流程。
+          void deleteImages([imageId])
+          return
+        }
+        settle(imageId)
+      },
+      (e) => {
+        // 存图失败（配额满等）不让流程中断 —— 记录照样能登记，只是没有图。
+        // 置 imageSaving:false 让登记按钮解锁，imageSaveFailed 黄条会说明原因。
+        console.warn('[image] 保存失败，本次登记将不带图片:', e)
+        if (activeShotRef.current === key) settle(null)
+      },
+    )
   }, [])
 
   const handleRegister = useCallback(
     (list: Omit<SnRecord, 'id' | 'time'>[]) => {
       addMany(list)
       savingRef.current = false
+      activeShotRef.current = null
       setScreen({ name: 'scan' })
     },
     [addMany],
@@ -88,6 +120,7 @@ export default function Home() {
 
   const handleRetake = useCallback(() => {
     savingRef.current = false
+    activeShotRef.current = null
     setScreen({ name: 'scan' })
   }, [])
   const openRecords = useCallback(() => setScreen({ name: 'records' }), [])
@@ -101,7 +134,10 @@ export default function Home() {
   // 不会提前松锁：multi 屏期间 screen.name === 'multi'，条件为假，本 effect 不释放；
   // 只有 screen.name 真正切走（不再是 'multi'）的那次渲染后才释放。
   useEffect(() => {
-    if (screen.name !== 'multi') savingRef.current = false
+    if (screen.name !== 'multi') {
+      savingRef.current = false
+      activeShotRef.current = null
+    }
   }, [screen.name])
 
   if (screen.name === 'records') {
@@ -119,7 +155,11 @@ export default function Home() {
         onRetake={handleRetake}
         onRegister={handleRegister}
         imageId={screen.imageId}
-        imageSaveFailed={screen.imageId === null}
+        imageSaving={screen.imageSaving}
+        // 「存图失败」只在落盘**结束后**才成立。落盘期间 imageId 也是 null，
+        // 若直接用 `imageId === null` 判失败，刚进识别页就会闪一条
+        // 「照片未能保存」的黄条 —— 那是在报一个还没发生、且多半不会发生的错。
+        imageSaveFailed={!screen.imageSaving && screen.imageId === null}
       />
     )
   }
@@ -128,7 +168,6 @@ export default function Home() {
       count={records.length}
       onShot={handleShot}
       onOpenRecords={openRecords}
-      setScreen={(s) => setScreen(s as Screen)}
     />
   )
 }

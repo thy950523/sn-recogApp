@@ -351,7 +351,7 @@ interface ServerOcrResponse {
   lines?: { text: string; conf: number; box: number[] }[]
 }
 
-/** 把 canvas 缩到最长边 maxEdge，减少上传体积 */
+/** Independent scan/upload adaptation; never replaces the saved original. */
 function scaleForUpload(canvas: HTMLCanvasElement, maxEdge: number): HTMLCanvasElement {
   const longest = Math.max(canvas.width, canvas.height)
   if (longest <= maxEdge) return canvas
@@ -371,23 +371,33 @@ async function callServerOcr(
   canvas: HTMLCanvasElement,
   serverUrl: string,
   timeoutMs = 20000,
+  original?: Blob,
 ): Promise<ServerOcrResponse | null> {
   if (!serverUrl) return null
   try {
-    // 放进 try：scaleForUpload 新建 canvas 并取 2d context，理论上可能抛错。
-    // 本函数的契约是「失败返回 null，由调用方降级」；若它抛出去，recognizeMulti
-    // 的 promise 会直接 reject，调用方还得自己兜 —— 那不是这个函数的契约。
-    const upload = scaleForUpload(canvas, 1600)
-    const blob = await new Promise<Blob | null>((resolve) =>
-      upload.toBlob(resolve, 'image/jpeg', 0.9),
-    )
+    // Match the existing server's 10 MiB body limit. Ordinary imported JPEG/PNG
+    // files go over the wire byte for byte, without another lossy encoding.
+    const maxBytes = 10 * 1024 * 1024
+    // Browser-decodable formats such as HEIC/SVG are not necessarily supported
+    // by OpenCV. Adapt those for OCR while preserving the original for storage.
+    const supportedType = original && (!original.type || /^image\/(jpeg|png|webp|bmp|tiff)$/.test(original.type))
+    let blob: Blob | null = original && supportedType && original.size <= maxBytes ? original : null
+    if (!blob) {
+      const upload = scaleForUpload(canvas, 2400)
+      blob = await new Promise<Blob | null>((resolve) =>
+        upload.toBlob(resolve, 'image/jpeg', 0.95),
+      )
+    }
     if (!blob) return null
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const res = await fetch(`${serverUrl}/ocr`, {
         method: 'POST',
-        headers: { 'Content-Type': 'image/jpeg', 'X-Ocr-Id': `multi-${Date.now()}` },
+        headers: {
+          'Content-Type': /^image\/(jpeg|png)$/.test(blob.type) ? blob.type : 'application/octet-stream',
+          'X-Ocr-Id': `multi-${Date.now()}`,
+        },
         body: blob,
         signal: controller.signal,
       })
@@ -402,12 +412,7 @@ async function callServerOcr(
   }
 }
 
-// 这里没有复用 recognize.ts 里已有的 runServerOcr，原因有二，都是硬约束：
-//   1. multiRecognize.ts 不能静态 import './recognize'（它顶层加载 tesseract.js 与 zxing-wasm，
-//      会打断 Node 单测）；把 runServerOcr 搬出来又要新建模块、改动核心识别文件，风险大于收益。
-//   2. 两者需求不同：recognizeSn 要把整图按 0.92 质量原样上传（标签字小，不能再降采样）；
-//      一图多码是整张照片，必须缩到 1600px 再传，否则体积和耗时都不可接受。
-// 因此这是**有意重复**，不是漏改。若日后要合并，先给 runServerOcr 加上「是否降采样」参数。
+// Keep the transport independent of recognize.ts's browser-only barcode/OCR imports.
 
 /**
  * 降级模式：OCR 没给出坐标，条码与 S/N 的配对是按合成坐标算的，几何上不可信。
@@ -449,22 +454,19 @@ export async function recognizeMulti(
   canvas: HTMLCanvasElement,
   serverUrl: string,
   onStage?: (stage: string) => void,
+  original?: Blob,
 ): Promise<MultiRecognizeResult> {
-  const imgW = canvas.width
-  const imgH = canvas.height
-
-  // ---- 1. 条码（本地 zxing，始终可用）----
-  onStage?.('扫描全部条形码…')
-  const { scanBarcodes } = await import('./recognize')
-  const rawBarcodes = await scanBarcodes(canvas)
+  // Start uploading before local barcode work; expensive barcode retries must
+  // not delay the independent server request. callServerOcr always resolves.
+  onStage?.('正在扫描条码并识别文字…')
+  const serverPromise = callServerOcr(canvas, serverUrl, 20000, original)
+  const scanCanvas = scaleForUpload(canvas, 1600)
+  const barcodePromise = import('./recognize').then(({ scanBarcodes }) => scanBarcodes(scanCanvas))
+  const [rawBarcodes, server] = await Promise.all([barcodePromise, serverPromise])
   const barcodes: DetectedBarcode[] = rawBarcodes.map((b) => ({
     value: b.value,
-    box: normalizeBox(b.box, imgW, imgH),
+    box: normalizeBox(b.box, scanCanvas.width, scanCanvas.height),
   }))
-
-  // ---- 2. OCR（服务端 RapidOCR，带坐标）----
-  onStage?.('正在识别文字…')
-  const server = await callServerOcr(canvas, serverUrl)
 
   if (server) {
     const serverText = typeof server.text === 'string' ? server.text : ''

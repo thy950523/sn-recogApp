@@ -78,6 +78,36 @@ export function shouldCheckByDefault(
 }
 
 /**
+ * 把候选行分成「可信」与「疑似」两组，返回**原数组下标**。
+ *
+ * 返回下标而不是行本身，是因为确认页的勾选、编辑、删行、高亮全部按 `rows` 的
+ * 下标寻址。一旦让分组产生新的数组，这些操作就会指向错的元素 ——
+ * 点第 2 行却改了第 3 行的 SN。
+ *
+ * 判据是 `anchor === 'marker'`：只有它来自 OCR 真正读到的 `S/N:` 标记，
+ * 也就是用户说的「已经识别到 SN 的具体值」那一类。另外两类都是猜的：
+ *   · `fallback` —— 兜底把标签上任何 8~17 位字母数字混合串当 SN，实测会把
+ *     型号行 `HUAWEl FreeBuds7`、执行标准行 `Q/DKBA2570-2024` 都算进来；
+ *   · `barcode`  —— SN 直接取自条码值，可 EAN13 占位码 `0000000000000` 也是
+ *     合法条码（zxing `isValid: true`），它未必承载 SN。
+ * 把它们平铺在主列表里，用户就得在「3 台设备 + 2 条噪音」里逐条判断该不该勾 ——
+ * 这正是要消除的负担。收进折叠区，既不污染主流程，又保留了兜底可见性
+ * （万一某台设备的 S/N 字样被读花，用户展开还能看到它）。
+ */
+export function partitionCandidates(rows: readonly CandidateRow[]): {
+  primaryIdx: number[]
+  secondaryIdx: number[]
+} {
+  const primaryIdx: number[] = []
+  const secondaryIdx: number[] = []
+  rows.forEach((r, i) => {
+    if (r.source.anchor === 'marker') primaryIdx.push(i)
+    else secondaryIdx.push(i)
+  })
+  return { primaryIdx, secondaryIdx }
+}
+
+/**
  * 是否需要在候选行上提示「条码 X」。
  *
  * 只在条码与（归一化后的）SN 确实不同时才提示。用原始 `sn` 比会出错：

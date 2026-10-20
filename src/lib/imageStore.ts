@@ -1,5 +1,7 @@
 /**
- * 图片仓库：把照片以压缩后的 JPEG Blob 存在 IndexedDB。
+ * 图片仓库：把照片以 JPEG Blob 存在 IndexedDB。
+ *
+ * **入库的字节就是拍摄载荷的原始字节，本模块不做任何二次编码**（见 saveDataUrlImage）。
  *
  * 为什么不用 localStorage：localStorage 只有约 5MB，一张照片就几百 KB，存两张就爆。
  * IndexedDB 能存 Blob 且配额按磁盘比例分配，适合放几百张照片。
@@ -20,16 +22,29 @@ export interface StoredImage {
   createdAt: number
 }
 
-/** 等比缩放到最长边不超过 maxEdge；未超出则原样返回 */
-export function scaleToMaxEdge(
-  width: number,
-  height: number,
-  maxEdge: number,
-): { width: number; height: number } {
-  const longest = Math.max(width, height)
-  if (longest <= maxEdge || longest === 0) return { width, height }
-  const scale = maxEdge / longest
-  return { width: Math.round(width * scale), height: Math.round(height * scale) }
+/**
+ * data: URL → Blob。
+ *
+ * 手写 base64 解码，**不要**改用 `fetch(dataUrl)`：那属于网络请求，会被 CSP 的
+ * `connect-src` 拦下，届时所有照片都存不上、且只在控制台留一行 —— 正是本项目
+ * 最忌讳的静默失败。atob 是纯计算，没有这个风险。
+ *
+ * 非 base64 的 data URL（`data:text/plain,hello`）按百分号编码解。本工程的调用方
+ * 只传 JPEG，但一个解码函数不该只对一种形态成立。
+ */
+export function dataUrlToBlob(dataUrl: string): Blob {
+  const comma = dataUrl.indexOf(',')
+  if (comma < 0) throw new Error('图片数据不是合法的 data URL')
+  const head = dataUrl.slice(0, comma)
+  const body = dataUrl.slice(comma + 1)
+  // head 形如 `data:image/jpeg;base64`；取不到 MIME 时给个中性的兜底，
+  // 不要留空串 —— 空 MIME 的 Blob 存进 IndexedDB 后，导出侧就无从判断类型了。
+  const mime = /^data:([^;,]*)/.exec(head)?.[1] || 'application/octet-stream'
+  if (!/;base64/i.test(head)) return new Blob([decodeURIComponent(body)], { type: mime })
+  const binary = atob(body)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: mime })
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -117,10 +132,20 @@ export async function putImage(blob: Blob, width: number, height: number): Promi
   return image.id
 }
 
+/**
+ * 按 id 读取整条图片记录（含原始宽高）。
+ *
+ * 导出侧要它而不是只要 Blob：把原图嵌进 xlsx 时，「显示尺寸」要按原始宽高算，
+ * 而 Blob 本身不带尺寸 —— 拿不到就只能 `createImageBitmap` 解码一次，白花一次解码。
+ */
+export async function getImage(id: string): Promise<StoredImage | null> {
+  const v = await withStore<StoredImage | undefined>('readonly', (s) => s.get(id))
+  return v ?? null
+}
+
 /** 按 id 读取图片 Blob */
 export async function getImageBlob(id: string): Promise<Blob | null> {
-  const v = await withStore<StoredImage | undefined>('readonly', (s) => s.get(id))
-  return v?.blob ?? null
+  return (await getImage(id))?.blob ?? null
 }
 
 // ---------------------------------------------------------------
@@ -218,24 +243,21 @@ export async function clearAll(): Promise<void> {
 }
 
 /**
- * 把 canvas 压缩成 JPEG 存入仓库，返回 imageId。
- * 默认最长边 1280px、质量 0.78 —— 单张约 150~250KB，标签文字仍清晰可读。
+ * 把拍摄载荷（data URL）**原样**存进仓库，返回 imageId。
+ *
+ * 这里曾经是「解码 dataUrl → 重画 canvas → 再压一次 JPEG(1280/0.78)」。那一步
+ * 有两个代价，都是纯亏：
+ *   · 画质 —— 载荷本来就是 JPEG（encodePayload 产出），再编一遍就是第二代压缩，
+ *     导出的「原图页」永远拿不到真正的原图。
+ *   · 时间 —— 一次全尺寸解码 + 一次全尺寸 JPEG 编码，正是拍照后那段卡顿的主因。
+ * 直接存原始字节，两个代价一起消失。
+ *
+ * 尺寸由调用方给出（= 载荷自身的宽高），不必再解码去量。
  */
-export async function saveCanvasImage(
-  canvas: HTMLCanvasElement,
-  maxEdge = 1280,
-  quality = 0.78,
+export async function saveDataUrlImage(
+  dataUrl: string,
+  width: number,
+  height: number,
 ): Promise<string> {
-  const { width, height } = scaleToMaxEdge(canvas.width, canvas.height, maxEdge)
-  const out = document.createElement('canvas')
-  out.width = width
-  out.height = height
-  const ctx = out.getContext('2d')
-  if (!ctx) throw new Error('无法创建画布上下文')
-  ctx.imageSmoothingEnabled = true
-  ctx.imageSmoothingQuality = 'high'
-  ctx.drawImage(canvas, 0, 0, width, height)
-  const blob = await new Promise<Blob | null>((resolve) => out.toBlob(resolve, 'image/jpeg', quality))
-  if (!blob) throw new Error('图片压缩失败')
-  return putImage(blob, width, height)
+  return putImage(dataUrlToBlob(dataUrl), width, height)
 }

@@ -5,18 +5,15 @@ import {
   hasSn,
   isDuplicateSn,
   barcodeDiffers,
+  partitionCandidates,
   shouldCheckByDefault,
   type CandidateRow,
 } from '@/lib/registerRows'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
+import type { ImagePayload } from '@/lib/imagePayload'
 
-/** 拍照/导入后传进来的图片载荷 */
-export interface ImagePayload {
-  dataUrl: string
-  width: number
-  height: number
-}
+export type { ImagePayload } from '@/lib/imagePayload'
 
 interface Props {
   image: ImagePayload
@@ -28,11 +25,37 @@ interface Props {
   /** 图片存入 IndexedDB 后的 imageId（登记时写入每条记录） */
   imageId: string | null
   /**
+   * 照片仍在往 IndexedDB 里写。这期间 imageId 还是 null，登记按钮必须置灰 ——
+   * 否则会写进一条没有 imageId 的记录（登记时拿到的就是 null），而用户当场
+   * 察觉不到，事后才发现照片全丢。
+   */
+  imageSaving?: boolean
+  /**
    * 存图失败（配额满等）时为 true：此时 imageId 为 null，登记的记录不会带图。
    * 失败不中断流程（照样能识别、能登记），但必须在界面上看得见，不能静默。
    * 可选：不传时行为与从前完全一致（不渲染任何提示）。
+   *
+   * 判据必须带上「已落盘结束」：落盘期间 imageId 同样是 null，只看 imageId
+   * 会让刚进识别页就闪一条还没发生的错误。
    */
   imageSaveFailed?: boolean
+}
+
+/**
+ * 页头状态文案。优先报「识别到几台设备」，只有一条可信候选都没有时才降级报疑似条数 ——
+ * 反过来（先报总数）会让页头说「5 台」而主列表只有 3 行，用户无从判断哪个是真的。
+ */
+function headline(
+  failed: string | null,
+  hasResult: boolean,
+  primaryCount: number,
+  secondaryCount: number,
+): string {
+  if (failed) return '识别失败'
+  if (!hasResult) return '识别中'
+  if (primaryCount) return `${primaryCount} 台`
+  if (secondaryCount) return `${secondaryCount} 条待确认`
+  return '未识别到'
 }
 
 /** 把归一化 Box4 转成绝对定位样式 */
@@ -56,6 +79,7 @@ export default function MultiResultView({
   onRetake,
   onRegister,
   imageId,
+  imageSaving,
   imageSaveFailed,
 }: Props) {
   const [stage, setStage] = useState('准备识别…')
@@ -130,7 +154,7 @@ export default function MultiResultView({
             resolve(
               recognizeMulti(canvas, OCR_SERVER_URL, (s) => {
                 if (stillCurrent()) setStage(s)
-              }),
+              }, image.blob),
             )
           } catch (e) {
             reject(e instanceof Error ? e : new Error(String(e)))
@@ -154,7 +178,7 @@ export default function MultiResultView({
     return () => {
       aliveRef.current = false
     }
-  }, [image.dataUrl, OCR_SERVER_URL])
+  }, [image.dataUrl, image.blob, OCR_SERVER_URL])
 
   /** 每行的勾选状态与可编辑 SN；result 到位时初始化 */
   const [rows, setRows] = useState<CandidateRow[]>([])
@@ -192,6 +216,24 @@ export default function MultiResultView({
   // 否则按钮说「登记 N 条」、实际却存了 M 条，是静默不一致。
   const checkedCount = rows.filter((r) => r.checked && hasSn(r.sn)).length
 
+  // 可信候选（OCR 真读到 S/N 标记）与疑似候选（文字/条码推断）分流。
+  // 规则本体与理由在 registerRows.partitionCandidates，那里是纯函数、有测试覆盖。
+  const { primaryIdx, secondaryIdx } = partitionCandidates(rows)
+  /** 疑似候选区的展开状态。主列表为空时它没有意义（见 secondaryOpen） */
+  const [showSecondary, setShowSecondary] = useState(false)
+  // 一条可信候选都没有时，疑似候选就是本次识别的全部结果，必须直接铺开：
+  // 藏起来会让用户以为「什么都没识别到」而重拍。此时也不渲染折叠按钮 ——
+  // 那个按钮点不动（展开状态被这里强制为 true），是个静默失效的控件。
+  const secondaryOpen = primaryIdx.length === 0 || showSecondary
+  /**
+   * 需要在原图上画框的行。
+   *
+   * 只画**可见**行：收起状态还给疑似候选画框，用户会看到一个列表里找不到、
+   * 也点不到（点了无法联动高亮）的黄框，只能猜它是什么。
+   */
+  const visibleIdx = secondaryOpen ? [...primaryIdx, ...secondaryIdx] : primaryIdx
+  const secondaryChecked = secondaryIdx.filter((i) => rows[i].checked && hasSn(rows[i].sn)).length
+
   const toggle = (i: number) =>
     setRows((prev) => prev.map((r, j) => (j === i ? { ...r, checked: !r.checked } : r)))
 
@@ -224,11 +266,103 @@ export default function MultiResultView({
     if (list.length) onRegister(list)
   }
 
+  /**
+   * 渲染一行候选。
+   *
+   * `i` 是它在 `rows` 里的下标 —— 勾选、编辑、删行、判重、高亮全部按它寻址，
+   * 不能换成「在主列表里的第几个」，否则点第 2 行会改到第 3 行。
+   * `no` 是**给人看的序号**，按可见位置从 1 连续编。
+   */
+  const renderRow = (i: number, no: number) => {
+    const row = rows[i]
+    const d = row.source
+    const dup = isDuplicate(row.sn, i)
+    // pending 是 Task 7 降级路径（OCR 无坐标）产出的状态，必须显式列出：
+    // 落到最后的兜底会显示成「⛔ 未识别」，那是在说「没识别到」，
+    // 而实际是「识别到了但配对未经校验」——两回事，会误导用户重拍。
+    //
+    // match / mismatch 的文案点名「OCR」与「条码」这两侧：用户要看的就是
+    // 「OCR 读到什么」和「条码扫出来匹不匹配」，只说「双验证一致」等于没说清比的是什么。
+    const statusLabel =
+      d.status === 'match' ? '✓ OCR 与条码一致'
+        : d.status === 'mismatch' ? '⚠ 条码与 OCR 不一致'
+        : d.status === 'barcode_only' ? '⚠ 仅条码'
+        : d.status === 'ocr_only' ? '⚠ 仅 OCR'
+        : d.status === 'pending' ? '⚠ 待人工确认'
+        : '⛔ 未识别'
+    const statusClass =
+      d.status === 'match' ? 'border-[#35d07f]/60 text-[#35d07f]'
+        : d.status === 'mismatch' || d.status === 'none' ? 'border-[#f00007]/60 text-[#ff6b6b]'
+        : 'border-[#ffc700]/60 text-[#ffc700]'
+    return (
+      <div
+        key={i}
+        onClick={() => setActiveIndex(i)}
+        className={`mb-2 border px-3 py-2.5 ${
+          activeIndex === i ? 'border-[#ffc700] bg-[#ffc700]/5' : 'border-[#2a2a2a]'
+        }`}
+      >
+        <div className="flex items-center gap-3">
+          <input
+            type="checkbox"
+            checked={row.checked}
+            onChange={() => toggle(i)}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`选择第 ${no} 台设备`}
+            className="h-5 w-5 shrink-0 accent-[#ffc700]"
+          />
+          <span className="w-6 shrink-0 font-mono text-[11px] text-[#555]">{no}</span>
+          <input
+            value={row.sn}
+            onChange={(e) => editSn(i, e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            autoCapitalize="characters"
+            autoCorrect="off"
+            spellCheck={false}
+            className="min-w-0 flex-1 border border-[#2a2a2a] bg-[#0a0a0a] px-2 py-1.5 font-mono text-base tracking-[0.1em] text-white uppercase outline-none focus:border-[#ffc700]"
+          />
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              drop(i)
+            }}
+            aria-label={`删除第 ${no} 台`}
+            className="shrink-0 border border-[#2a2a2a] px-2 py-1 font-mono text-xs text-[#84898e] active:bg-[#161616]"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-2 pl-9">
+          <span className={`border px-1.5 py-0.5 font-mono text-[10px] ${statusClass}`}>
+            {statusLabel}
+          </span>
+          {dup && (
+            <span className="border border-[#f00007]/60 px-1.5 py-0.5 font-mono text-[10px] text-[#ff6b6b]">
+              ⛔ 重复
+            </span>
+          )}
+          {/* 判据本体（为什么必须按归一化值比较、用原始值比会显示一条
+              本不存在的「条码 X」而记录其实会以 source='barcode'、
+              verified=true 入库）在 registerRows.barcodeDiffers，
+              那里是纯函数、有测试覆盖。这里只负责把值传进去。 */}
+          {barcodeDiffers(d.barcode, row.sn) && (
+            <span className="font-mono text-[10px] text-[#777]">条码 {d.barcode}</span>
+          )}
+          {d.imei && <span className="font-mono text-[10px] text-[#777]">IMEI {d.imei}</span>}
+          {d.imei2 && <span className="font-mono text-[10px] text-[#777]">IMEI2 {d.imei2}</span>}
+          {d.eid && <span className="font-mono text-[10px] text-[#777]">EID {d.eid}</span>}
+          {d.meid && <span className="font-mono text-[10px] text-[#777]">MEID {d.meid}</span>}
+        </div>
+        {d.note && <p className="mt-1 pl-9 font-mono text-[10px] text-[#ffc700]">{d.note}</p>}
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-[100dvh] flex-col bg-black text-white">
       <header className="flex items-center justify-between px-5 pt-[max(env(safe-area-inset-top),16px)] pb-3">
         <div className="font-mono text-[11px] tracking-[0.25em] text-[#84898e] uppercase">
-          批量识别&nbsp;/&nbsp;{failed ? '识别失败' : result ? `${rows.length} 台` : '识别中'}
+          批量识别&nbsp;/&nbsp;{headline(failed, !!result, primaryIdx.length, secondaryIdx.length)}
         </div>
         <button
           onClick={onRetake}
@@ -259,8 +393,8 @@ export default function MultiResultView({
         <div className="relative mx-auto w-fit">
           <img src={image.dataUrl} alt="拍摄照片" className="block max-h-[40dvh] max-w-full" />
           {/* 标注层：归一化坐标直接换算成百分比，无需知道显示尺寸 */}
-          {rows.map((row, i) => {
-            const d = row.source
+          {visibleIdx.map((i, n) => {
+            const d = rows[i].source
             // 角标锚点：SN 框优先，退到第一个条码框，**都没有就不画**。
             // 不要用 `?? [0, 0, 0, 0]` 兜底 —— 那会在图片左上角戳出一个凭空的角标，
             // 而降级模式下 markUnverified 已把 snBox 与 barcodeBoxes 都清空
@@ -292,13 +426,15 @@ export default function MultiResultView({
                     放不放得下取决于图片的**渲染像素高度**，而它随宽高比变化
                     （3:1 全景图只有 ~125px 高，9:16 竖图有 ~340px），一个常数盖不住。
                     画在框内是确定的，代价是盖住 SN 文字开头一两个字符 —— 可以接受，
-                    因为 SN 就在下面的候选行里逐字显示。 */}
+                    因为 SN 就在下面的候选行里逐字显示。
+                    角标用**可见位置** n+1 而不是行下标 i：疑似候选收起时下标会跳号
+                    （1、2、4…），而列表里根本没有第 3 行，用户会以为漏识别了一台。 */}
                 {badgeAnchor && (
                   <span
                     className="absolute bg-[#ffc700] px-1 font-mono text-[10px] font-bold text-black"
                     style={badgeStyle(badgeAnchor)}
                   >
-                    {i + 1}
+                    {n + 1}
                   </span>
                 )}
               </div>
@@ -326,88 +462,44 @@ export default function MultiResultView({
             ⚠ {result.error}
           </div>
         )}
-        {rows.map((row, i) => {
-          const d = row.source
-          const dup = isDuplicate(row.sn, i)
-          // pending 是 Task 7 降级路径（OCR 无坐标）产出的状态，必须显式列出：
-          // 落到最后的兜底会显示成「⛔ 未识别」，那是在说「没识别到」，
-          // 而实际是「识别到了但配对未经校验」——两回事，会误导用户重拍。
-          const statusLabel =
-            d.status === 'match' ? '✓ 双验证一致'
-              : d.status === 'mismatch' ? '⚠ 与条码不一致'
-              : d.status === 'barcode_only' ? '⚠ 仅条码'
-              : d.status === 'ocr_only' ? '⚠ 仅 OCR'
-              : d.status === 'pending' ? '⚠ 待人工确认'
-              : '⛔ 未识别'
-          const statusClass =
-            d.status === 'match' ? 'border-[#35d07f]/60 text-[#35d07f]'
-              : d.status === 'mismatch' || d.status === 'none' ? 'border-[#f00007]/60 text-[#ff6b6b]'
-              : 'border-[#ffc700]/60 text-[#ffc700]'
-          return (
-            <div
-              key={i}
-              onClick={() => setActiveIndex(i)}
-              className={`mb-2 border px-3 py-2.5 ${
-                activeIndex === i ? 'border-[#ffc700] bg-[#ffc700]/5' : 'border-[#2a2a2a]'
-              }`}
-            >
-              <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  checked={row.checked}
-                  onChange={() => toggle(i)}
-                  onClick={(e) => e.stopPropagation()}
-                  aria-label={`选择第 ${i + 1} 台设备`}
-                  className="h-5 w-5 shrink-0 accent-[#ffc700]"
-                />
-                <span className="w-6 shrink-0 font-mono text-[11px] text-[#555]">{i + 1}</span>
-                <input
-                  value={row.sn}
-                  onChange={(e) => editSn(i, e.target.value)}
-                  onClick={(e) => e.stopPropagation()}
-                  autoCapitalize="characters"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  className="min-w-0 flex-1 border border-[#2a2a2a] bg-[#0a0a0a] px-2 py-1.5 font-mono text-base tracking-[0.1em] text-white uppercase outline-none focus:border-[#ffc700]"
-                />
+        {/* 主列表：只有 OCR 真读到 S/N 标记的候选。这些就是「设备」，
+            已经按条码比对过、默认全勾选 —— 用户看一眼状态就能直接点登记，
+            不必在噪音里逐条判断该不该勾。 */}
+        {primaryIdx.map((i, n) => renderRow(i, n + 1))}
+
+        {/* 疑似候选（文字推断 / 仅条码）。收在折叠区里，避免和真设备混在一起
+            让用户以为「识别出了 5 台」。一条可信候选都没有时直接铺开 ——
+            见 secondaryOpen 的说明。 */}
+        {primaryIdx.length === 0
+          ? secondaryIdx.length > 0 && (
+              <>
+                {/* 文案写成单个表达式：JSX 会把源码里的换行+缩进折成一个空格，
+                    中文句子中间凭空多一个空格，排版会看出来。 */}
+                <p className="mb-2 font-mono text-[11px] leading-5 text-[#84898e]">
+                  {`未读到 S/N 标记。以下 ${secondaryIdx.length} 条由文字或条码推断，可能不是 SN，请人工确认。`}
+                </p>
+                {secondaryIdx.map((i, n) => renderRow(i, primaryIdx.length + n + 1))}
+              </>
+            )
+          : secondaryIdx.length > 0 && (
+              <div className="mt-3">
                 <button
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    drop(i)
-                  }}
-                  aria-label={`删除第 ${i + 1} 台`}
-                  className="shrink-0 border border-[#2a2a2a] px-2 py-1 font-mono text-xs text-[#84898e] active:bg-[#161616]"
+                  onClick={() => setShowSecondary((v) => !v)}
+                  className="flex w-full items-center justify-between border border-[#2a2a2a] px-3 py-2.5 font-mono text-[11px] text-[#84898e] active:bg-[#161616]"
                 >
-                  ✕
-                </button>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-2 pl-9">
-                <span className={`border px-1.5 py-0.5 font-mono text-[10px] ${statusClass}`}>
-                  {statusLabel}
-                </span>
-                {dup && (
-                  <span className="border border-[#f00007]/60 px-1.5 py-0.5 font-mono text-[10px] text-[#ff6b6b]">
-                    ⛔ 重复
+                  <span>
+                    另有 {secondaryIdx.length} 条疑似候选（可能不是 SN）
+                    {secondaryChecked > 0 && ` · 已选 ${secondaryChecked}`}
                   </span>
+                  <span className="shrink-0 pl-2">{showSecondary ? '收起 ▴' : '展开 ▾'}</span>
+                </button>
+                {showSecondary && (
+                  <div className="mt-2">
+                    {secondaryIdx.map((i, n) => renderRow(i, primaryIdx.length + n + 1))}
+                  </div>
                 )}
-                {/* 判据本体（为什么必须按归一化值比较、用原始值比会显示一条
-                    本不存在的「条码 X」而记录其实会以 source='barcode'、
-                    verified=true 入库）在 registerRows.barcodeDiffers，
-                    那里是纯函数、有测试覆盖。这里只负责把值传进去。 */}
-                {barcodeDiffers(d.barcode, row.sn) && (
-                  <span className="font-mono text-[10px] text-[#777]">条码 {d.barcode}</span>
-                )}
-                {d.imei && <span className="font-mono text-[10px] text-[#777]">IMEI {d.imei}</span>}
-                {d.imei2 && <span className="font-mono text-[10px] text-[#777]">IMEI2 {d.imei2}</span>}
-                {d.eid && <span className="font-mono text-[10px] text-[#777]">EID {d.eid}</span>}
-                {d.meid && <span className="font-mono text-[10px] text-[#777]">MEID {d.meid}</span>}
               </div>
-              {d.note && (
-                <p className="mt-1 pl-9 font-mono text-[10px] text-[#ffc700]">{d.note}</p>
-              )}
-            </div>
-          )
-        })}
+            )}
 
         {/* rows 为空有两种来路：识别确实没结果，或用户自己把候选行删光了。
             对后者说「未识别到，请重拍」是误导 —— 数据是用户删的，不是没拍到。 */}
@@ -421,12 +513,14 @@ export default function MultiResultView({
       </div>
 
       <footer className="border-t border-[#1a1a1a] px-4 pt-3 pb-[max(env(safe-area-inset-bottom),16px)]">
+        {/* 落盘期间必须置灰：此时 imageId 还是 null，登记下去的照片就丢了。
+            置灰同时**改文案** —— 只置灰不给字，用户点了没反应会以为是卡死。 */}
         <button
           onClick={register}
-          disabled={checkedCount === 0}
+          disabled={checkedCount === 0 || imageSaving}
           className="w-full bg-[#ffc700] py-4 font-mono text-base font-bold tracking-[0.25em] text-black uppercase active:bg-[#e0b000] disabled:bg-[#2a2a2a] disabled:text-[#666]"
         >
-          登记选中的 {checkedCount} 条
+          {imageSaving ? '正在保存照片…' : `登记选中的 ${checkedCount} 条`}
         </button>
       </footer>
     </div>

@@ -4,6 +4,7 @@ import {
   hasSn,
   isDuplicateSn,
   barcodeDiffers,
+  partitionCandidates,
   shouldCheckByDefault,
   type CandidateRow,
 } from './registerRows'
@@ -326,5 +327,48 @@ describe('shouldCheckByDefault', () => {
 
   it('归一化后为空的 SN → 不默认勾选（勾了也存不进，会让按钮计数与落库不一致）', () => {
     expect(shouldCheckByDefault(candidate({ sn: '---', anchor: 'marker' }), [])).toBe(false)
+  })
+})
+
+describe('partitionCandidates', () => {
+  // 这个分流决定「哪些行会被当成设备摆在主列表上」。判错不会报错，只会让用户
+  // 重新陷入「在噪音里逐条判断该不该勾」——正是这次要消除的负担。
+  it('marker 候选进主列表，fallback / barcode 进疑似区', () => {
+    const rows = [
+      row({ source: candidate({ sn: 'SN0001', anchor: 'marker' }) }),
+      row({ source: candidate({ sn: 'FREEBUDS7', anchor: 'fallback' }) }),
+      row({ source: candidate({ sn: '0000000000000', anchor: 'barcode' }) }),
+    ]
+    expect(partitionCandidates(rows)).toEqual({ primaryIdx: [0], secondaryIdx: [1, 2] })
+  })
+
+  it('返回的是 rows 的**下标**，不是行本身', () => {
+    // 返回新数组会让勾选/编辑/删行全部指向错的元素：点第 2 行改到第 3 行的 SN。
+    const rows = [
+      row({ source: candidate({ anchor: 'fallback' }) }),
+      row({ source: candidate({ anchor: 'marker' }) }),
+    ]
+    const { primaryIdx, secondaryIdx } = partitionCandidates(rows)
+    expect(rows[primaryIdx[0]].source.anchor).toBe('marker')
+    expect(rows[secondaryIdx[0]].source.anchor).toBe('fallback')
+  })
+
+  it('保持各组内的原有相对顺序（主列表要与原图从上到下的顺序一致）', () => {
+    const rows = [
+      row({ source: candidate({ sn: 'A1', anchor: 'marker' }) }),
+      row({ source: candidate({ sn: 'X1', anchor: 'fallback' }) }),
+      row({ source: candidate({ sn: 'A2', anchor: 'marker' }) }),
+      row({ source: candidate({ sn: 'X2', anchor: 'fallback' }) }),
+    ]
+    expect(partitionCandidates(rows)).toEqual({ primaryIdx: [0, 2], secondaryIdx: [1, 3] })
+  })
+
+  it('全是疑似候选时主列表为空（界面据此把疑似区直接铺开）', () => {
+    const rows = [row({ source: candidate({ anchor: 'fallback' }) })]
+    expect(partitionCandidates(rows)).toEqual({ primaryIdx: [], secondaryIdx: [0] })
+  })
+
+  it('空数组不炸', () => {
+    expect(partitionCandidates([])).toEqual({ primaryIdx: [], secondaryIdx: [] })
   })
 })
