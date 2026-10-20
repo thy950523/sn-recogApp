@@ -33,3 +33,9 @@ __pycache__/
 
 # Local HTTPS keys/certs (never commit private keys)
 *.pem
+
+# Collected recognition images and OCR metadata
+/tmp/recognition-samples/
+
+# impeccable 设计工具的工作目录（design.json + 评审截图）
+.impeccable/
