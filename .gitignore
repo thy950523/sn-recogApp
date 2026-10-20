@@ -23,6 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 .pids/
+.playwright-mcp/
 
 # Python virtualenv / caches
 .venv/

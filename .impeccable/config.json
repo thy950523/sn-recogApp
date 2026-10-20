@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "broken-image",
+        "value": "*",
+        "files": [
+          "src/sections/MultiResultView.tsx"
+        ],
+        "createdAt": "2026-10-20T06:12:21.901Z",
+        "reason": "Agent reviewed: flagged line is a JSX comment discussing the img box; actual image has src={image.dataUrl}, populated by the capture/import payload. No placeholder or empty source."
+      }
+    ]
+  }
+}

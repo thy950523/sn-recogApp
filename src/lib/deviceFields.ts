@@ -4,7 +4,7 @@
  * 连续扫描 RapidOCR/Tesseract 全文）共用本模块。
  */
 
-import type { ImeiField, MatchedField } from '@/types'
+import type { ImeiField, LabelField, MatchedField } from '@/types'
 
 /** 归一化：大写、去掉非字母数字字符 */
 export function normalizeSn(s: string): string {
@@ -33,7 +33,18 @@ export function extractSnByMarker(text: string): string | null {
 
 export interface DeviceFieldsResult {
   sn: MatchedField | null
-  /** 按 IMEI1、IMEI2 顺序排列（槽位数字优先，未知槽位按出现顺序） */
+  /**
+   * 按槽位 1、2 顺序排列（槽位数字优先）。
+   *
+   * 未标槽位的 IMEI 会在补槽位阶段占用空闲槽位，因此**正常情况下这里不会出现
+   * `slot: null`** —— 只有 1、2 两个槽位都已被占满（如机身印了三个 IMEI）时，
+   * 溢出的那条才会保持 `slot: null` 并排在最后。
+   *
+   * **消费侧一律用 `imeiBySlot` 按槽位取值，不要按下标取**（`imeis[0]` / `imeis[1]`）：
+   * 数组虽已按槽位排过序，但槽位 1 可能整个缺席（机身只印 IMEI2、或 OCR 漏读 IMEI1 那行），
+   * 此时 `imeis[0].slot === 2`，按下标取会把 IMEI2 的值填进 imei 字段、imei2 留空 ——
+   * 两个字段的标签整体写反。详见 `imeiBySlot`。
+   */
   imeis: ImeiField[]
   meid: MatchedField | null
   eid: MatchedField | null
@@ -154,11 +165,118 @@ export function extractDeviceFields(rawText: string, barcodes: string[]): Device
     addImei(m[2], slotOf(m[1]))
   }
 
-  // 排序：IMEI1（槽位 1）在前、IMEI2（槽位 2）在后、无槽位按出现顺序
-  imeis.sort((a, b) => {
+  // 排序：IMEI1（槽位 1）在前、IMEI2（槽位 2）在后。
+  // 未标槽位（slot=null）的 IMEI 按出现顺序补进空闲槽位，而不是直接排在已知槽位之后：
+  // 机身常见的「IMEI: xxx」+「IMEI2: yyy」排版里，第一行标签没印槽位数字，slot 为 null。
+  // 补槽位与排序仍然必要，作用有二：① 不丢值 —— 让「未标槽位的那条」也能被槽位 1 取到；
+  // ② 顺序确定 —— 数组顺序与物理标签一致，展示时不会忽前忽后。
+  // 但字段归属**由 imeiBySlot 按槽位决定，不再依赖数组下标**：因此即便槽位 1 整个缺席
+  // （机身只印了 IMEI2、或 OCR 漏读 IMEI1 那行），imeiBySlot(imeis, 1) 也会如实返回 null，
+  // 而不是把 IMEI2 的值按下标误填进 imei 字段。
+  // 槽位号只有 1、2 两个（对应 IMEI1/IMEI2）；两个都被占用时（如三个 IMEI）保持 null 排最后。
+  const usedSlots = new Set<number>()
+  for (const f of imeis) if (f.slot !== null) usedSlots.add(f.slot)
+  const ranked = imeis.map((f) => {
+    if (f.slot !== null) return f
+    let free = 1
+    while (usedSlots.has(free)) free++
+    if (free > 2) return f // 1、2 已占满，无空闲槽位可补
+    usedSlots.add(free)
+    return { ...f, slot: free } // 不改传入对象
+  })
+  ranked.sort((a, b) => {
     const rank = (s: number | null) => (s === 1 ? 0 : s === 2 ? 1 : 2)
     return rank(a.slot) - rank(b.slot)
   })
 
-  return { sn, imeis, meid, eid }
+  return { sn, imeis: ranked, meid, eid }
+}
+
+/**
+ * 按槽位取 IMEI 值。消费侧一律走这里，**不要**用 `imeis[0]` / `imeis[1]`。
+ *
+ * 数组虽然按槽位排过序，但**槽位 1 可能整个缺席**（机身只印了 IMEI2，或 OCR 漏读了
+ * IMEI1 那行），此时 imeis[0].slot === 2，按下标取会把 IMEI2 的值填进 imei 字段、
+ * imei2 留空 —— 两个字段的标签整体写反，而确认页里这两格是只读文本，用户无法手工修正。
+ */
+export function imeiBySlot(imeis: readonly ImeiField[], slot: 1 | 2): string | null {
+  return imeis.find((f) => f.slot === slot)?.value ?? null
+}
+
+/** 带 EID/IMEI 等标签前缀的行——那些行印的本来就不是 SN */
+export const NON_SN_LABEL = /EID|IMEI|CMIIT|MEID|MODEL|UPC|EAN/i
+
+/** 标签字段的类型定义在 '@/types'（SnRecord 也要用），这里转出以保持既有引用可用 */
+export type { LabelField }
+
+/**
+ * 已被专门列接管的 key（按 normalizeSn 归一化后比较）。
+ *
+ * 归一化是必须的：标签上印的是 `S/N`，归一化后才是 `SN`。直接比对原文的话，
+ * `S/N:A1B2...` 会变成一条 key 为「S/N」的标签字段，与 SN 列重复。
+ */
+const DEDICATED_KEYS = new Set(['SN', 'IMEI', 'IMEI1', 'IMEI2', 'MEID', 'EID'])
+
+/**
+ * 从 OCR 文本里提取标签上的其他信息（型号 / 颜色 / 执行标准 / CMIIT ID…）。
+ *
+ * 用**通用**的 `key：value` 解析，不写品牌字段白名单：白名单能覆盖华为，
+ * 换小米、苹果就得再写一套，维护成本随品牌数线性增长，且漏掉新品牌时是
+ * 静默丢失。而设备标签的排版惯例就是「标签名：值」，通用解析能跨品牌工作。
+ *
+ * 全角 `：` 与半角 `:` 都认 —— OCR 对两者都可能输出。
+ * 无冒号的行（品牌行 `HUAWEl FreeBuds7`、`合格`、日期 `2026.07`）不是字段，
+ * 它们留在 rawOcr 原文里，需要时人工看。
+ *
+ * 只做提取，不做语义校验：值长什么样就存什么样。这些字段不参与 SN 判定，
+ * 也不进人工确认页 —— 确认页只关心 SN，其他信息是留给导出表格追溯用的。
+ */
+export function extractLabelFields(rawText: string): LabelField[] {
+  const out: LabelField[] = []
+  const seen = new Set<string>()
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    // key 限 1~24 字符且惰性匹配，遇到**第一个**冒号就断开：
+    // 值里含冒号（如 `地址: A:B:C`）时整段仍算 value，不被二次切开。
+    const m = rawLine.match(/^\s*(.{1,24}?)\s*[：:]\s*(\S.*)$/)
+    if (!m) continue
+    const key = m[1].trim()
+    const value = m[2].trim()
+    // 冒号后为空（`颜色：`）不算字段 —— 存一条空值只会在表格里占一列
+    if (!key || !value) continue
+    if (DEDICATED_KEYS.has(normalizeSn(key))) continue
+    // 同 key 保留首次：多轮 OCR 拼接会让同一行出现两次
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ key, value })
+  }
+  return out
+}
+
+/** 抹掉 CMIIT ID、IMEI 等非 SN 字段，防止兜底候选误取 */
+function stripNonSnLabels(text: string): string {
+  return text
+    .replace(/CMIIT[^A-Z0-9]{0,6}(?:ID)?[^A-Z0-9]{0,4}[A-Z0-9]{4,20}/gi, ' ')
+    .replace(/IMEI[^A-Z0-9]{0,6}[A-Z0-9]{6,20}/gi, ' ')
+    .replace(/(?:MEID|EAN|UPC|MODEL|P\/N|PN)[^A-Z0-9]{0,4}[A-Z0-9]{6,20}/gi, ' ')
+}
+
+/** 兜底：无标记时从全文提取疑似 SN 的候选（8~17 位，同时含字母与数字） */
+export function extractSnCandidates(text: string): string[] {
+  const tokens = stripNonSnLabels(text).toUpperCase().split(/[^A-Z0-9]+/)
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const t of tokens) {
+    if (t.length < 8 || t.length > 17) continue
+    if (!/[A-Z]/.test(t) || !/[0-9]/.test(t)) continue
+    if (seen.has(t)) continue
+    seen.add(t)
+    out.push(t)
+  }
+  const score = (s: string) => {
+    let sc = 0
+    if (s.length >= 10 && s.length <= 14) sc += 10
+    sc += Math.min(s.length, 14)
+    return sc
+  }
+  return out.sort((a, b) => score(b) - score(a))
 }

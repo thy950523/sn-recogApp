@@ -8,7 +8,7 @@ import { useRecords } from '@/lib/store'
 import type { BarcodeResult } from '@/lib/cameraEngine'
 import type { ContinuousScanRecord } from '@/types'
 import { extractSnCandidates, preloadOcr } from '@/lib/recognize'
-import { extractDeviceFields, type DeviceFieldsResult } from '@/lib/deviceFields'
+import { extractDeviceFields, imeiBySlot, type DeviceFieldsResult } from '@/lib/deviceFields'
 import { copyAll } from '@/lib/export'
 
 interface ContinuousScanViewProps {
@@ -306,8 +306,8 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
       ocr: null,
       ocrConsistent: null,
       ocrNote: null,
-      imei: fields?.imeis[0]?.value ?? null,
-      imei2: fields?.imeis[1]?.value ?? null,
+      imei: fields ? imeiBySlot(fields.imeis, 1) : null,
+      imei2: fields ? imeiBySlot(fields.imeis, 2) : null,
       meid: fields?.meid?.value ?? null,
       eid: fields?.eid?.value ?? null,
       rawOcr: ocrTextRef.current,
@@ -323,8 +323,8 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
         updateRecordOcr(recordId, {
           ocr: ocrSn,
           consistent: found !== null,
-          imei: f.imeis[0]?.value ?? null,
-          imei2: f.imeis[1]?.value ?? null,
+          imei: imeiBySlot(f.imeis, 1),
+          imei2: imeiBySlot(f.imeis, 2),
           meid: f.meid?.value ?? null,
           eid: f.eid?.value ?? null,
           rawOcr: text || null,

@@ -2,10 +2,17 @@ import { readBarcodes, setZXingModuleOverrides } from 'zxing-wasm/reader'
 import zxingWasmUrl from 'zxing-wasm/reader/zxing_reader.wasm?url'
 import { createWorker, PSM, type Worker } from 'tesseract.js'
 import type { RecognizeOutcome, VerifyStatus } from '@/types'
-import { extractDeviceFields, normalizeSn, extractSnByMarker } from './deviceFields'
+import {
+  extractDeviceFields,
+  normalizeSn,
+  extractSnByMarker,
+  extractSnCandidates,
+  NON_SN_LABEL,
+} from './deviceFields'
 
-// 归一化 / S/N 标记提取已迁至 deviceFields.ts，此处转出保持现有引用可用
-export { normalizeSn, extractSnByMarker }
+// 归一化 / S/N 标记提取 / 候选提取已迁至 deviceFields.ts，此处转出保持现有引用可用
+export { normalizeSn, extractSnByMarker, extractSnCandidates }
+export { PSM }
 
 setZXingModuleOverrides({
   locateFile: (path: string) => (path.endsWith('.wasm') ? zxingWasmUrl : path),
@@ -13,7 +20,6 @@ setZXingModuleOverrides({
 
 /** 某行 OCR 文本中是否完整包含某个条码值（标记被误读时的保底）。
  *  带 EID/IMEI 等标签前缀的行排除——那些行印的本来就不是 SN */
-const NON_SN_LABEL = /EID|IMEI|CMIIT|MEID|MODEL|UPC|EAN/i
 function containsBarcode(text: string, barcodes: string[]): string | null {
   if (NON_SN_LABEL.test(text)) return null
   const n = normalizeSn(text)
@@ -22,35 +28,6 @@ function containsBarcode(text: string, barcodes: string[]): string | null {
     if (b.length >= 8 && /[A-Z]/.test(b) && /[0-9]/.test(b) && n.includes(b)) return b
   }
   return null
-}
-
-/** 抹掉 CMIIT ID、IMEI 等非 SN 字段，防止兜底候选误取 */
-function stripNonSnLabels(text: string): string {
-  return text
-    .replace(/CMIIT[^A-Z0-9]{0,6}(?:ID)?[^A-Z0-9]{0,4}[A-Z0-9]{4,20}/gi, ' ')
-    .replace(/IMEI[^A-Z0-9]{0,6}[A-Z0-9]{6,20}/gi, ' ')
-    .replace(/(?:MEID|EAN|UPC|MODEL|P\/N|PN)[^A-Z0-9]{0,4}[A-Z0-9]{6,20}/gi, ' ')
-}
-
-/** 兜底：无标记时从全文提取疑似 SN 的候选（8~17 位，同时含字母与数字） */
-export function extractSnCandidates(text: string): string[] {
-  const tokens = stripNonSnLabels(text).toUpperCase().split(/[^A-Z0-9]+/)
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const t of tokens) {
-    if (t.length < 8 || t.length > 17) continue
-    if (!/[A-Z]/.test(t) || !/[0-9]/.test(t)) continue
-    if (seen.has(t)) continue
-    seen.add(t)
-    out.push(t)
-  }
-  const score = (s: string) => {
-    let sc = 0
-    if (s.length >= 10 && s.length <= 14) sc += 10
-    sc += Math.min(s.length, 14)
-    return sc
-  }
-  return out.sort((a, b) => score(b) - score(a))
 }
 
 // ---------------------------------------------------------------- 图像工具
@@ -255,11 +232,120 @@ function toHit(
   }
 }
 
+// ---------------------------------------------------------------- 原生条码检测
+
+/**
+ * 浏览器原生 BarcodeDetector（Chrome / Android Chrome 有，Firefox 与 iOS Safari 没有）。
+ *
+ * 与 `cameraEngine.ts` 里那份同名声明各在自己的模块内可见，互不影响。没有抽成共享类型，
+ * 是因为两处只用到 `rawValue` / `boundingBox` 两个字段，为此新建一个模块不划算。
+ */
+declare class BarcodeDetector {
+  constructor(options: { formats: string[] })
+  detect(source: ImageBitmapSource): Promise<
+    Array<{ rawValue: string; format: string; boundingBox?: DOMRectReadOnly }>
+  >
+  static getSupportedFormats(): Promise<string[]>
+}
+
+/**
+ * 原生检测器实例（惰性建、只建一次）。不可用时为 null —— 连 null 也一起缓存，
+ * 免得在 Firefox / iOS Safari 上每张照片都白探一遍 `getSupportedFormats()`。
+ *
+ * 缓存实例而不是每次现建：这是每张照片都会走的热路径，而 `getSupportedFormats()`
+ * 是异步的，现建等于每张图多一次无谓的 await。
+ */
+let nativeDetectorPromise: Promise<BarcodeDetector | null> | null = null
+
+function getNativeDetector(): Promise<BarcodeDetector | null> {
+  if (!nativeDetectorPromise) {
+    nativeDetectorPromise = (async () => {
+      if (typeof window === 'undefined' || !('BarcodeDetector' in window)) return null
+      try {
+        // 传全部受支持格式，不做白名单：原生这边格式名写作 `code_128`，与 zxing 的
+        // `Code128` 不是一套写法，自己映射一遍只是多一处可能写错的地方。多认出的格式
+        // 最多给人工确认页多一条待核对候选（不会静默写错数据），代价远小于漏认。
+        const formats = await BarcodeDetector.getSupportedFormats()
+        if (!formats.length) return null
+        return new BarcodeDetector({ formats })
+      } catch {
+        return null
+      }
+    })()
+  }
+  return nativeDetectorPromise
+}
+
+/**
+ * 用原生 BarcodeDetector 扫一遍画布；引擎不可用或抛错时返回空数组。
+ *
+ * **为什么拍照链路也要跑它**（实测，输入是华为包装盒标签，一张图 4 个 Code128）：
+ *
+ * | 画布尺寸 | zxing | 原生 |
+ * |---|---|---|
+ * | 1200×1600 | 3 个（IMEI1 那个框只有 2.9px 高） | 4 个 |
+ * | 1100×1467 | 2 个 | 4 个 |
+ * | 1000×1333 | **0 个** | 4 个 |
+ * | 900×1200 | **0 个**（连跑 3 次都是 0，非竞态） | 4 个 |
+ *
+ * zxing 在这张图上没有单调性（3/2/0/3/0/1/0），换 `binarizer` / `tryDownscale` /
+ * `downscaleFactor` 都救不回来 —— 它是真的读不出来，不是参数没调对。
+ * 而 App 实际喂进来的载荷最长边只有 1600（竖拍手机视频 1080×1920 → 载荷 900×1600），
+ * 落在上表后半段正是**一个条码都读不到**，用户报的「没识别到条形码」就是这么来的。
+ *
+ * 相机预览（`ContinuousScanView` → `CameraEngine`）本来就在用原生检测器，
+ * 只有拍照链路一直在裸用 zxing，这是两条链路识别率差异的来源。
+ */
+async function readWithNativeDetector(canvas: HTMLCanvasElement): Promise<BarHit[]> {
+  const detector = await getNativeDetector()
+  if (!detector) return []
+  try {
+    const results = await detector.detect(canvas)
+    const hits: BarHit[] = []
+    for (const r of results) {
+      const v = normalizeSn(r.rawValue)
+      if (v.length < 4) continue
+      const b = r.boundingBox
+      if (!b) continue
+      const x = b.x
+      const y = b.y
+      const w = Math.max(1, b.width)
+      const h = Math.max(1, b.height)
+      hits.push({
+        value: v,
+        box: { x, y, w, h },
+        // 原生只给轴对齐包围盒、没有四角，按包围盒四角补齐。
+        // 消费 `corners` / `angle` 的只有 extractTextStrip 的纠偏，而它只被已废弃的
+        // recognizeSn 用到（见其函数头注释），拍照链路不读这两个字段。
+        corners: [
+          { x, y },
+          { x: x + w, y },
+          { x, y: y + h },
+          { x: x + w, y: y + h },
+        ],
+        angle: 0,
+      })
+    }
+    return hits
+  } catch {
+    return []
+  }
+}
+
 /** 扫描照片中的全部条形码；正拍读不到时做旋转扫描，应对倾斜拍摄 */
 async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
   const found = new Map<string, BarHit>()
 
-  // 第 1 轮：原图
+  // 第 0 轮：原生 BarcodeDetector。放在最前是因为两件事：
+  //   · 它的**框**比 zxing 准（实测同一条码 zxing 报 2.9px 高、原生报 34px），
+  //     而下面每个分支都是 `!found.has(...)` 才写入 —— 先写谁就留谁的框；
+  //   · 它只花约 30ms，比 zxing 那几轮便宜得多。
+  // 两个引擎的结果取并集而不是二选一：它们的失败模式不同，谁都可能读到对方读不到的。
+  for (const hit of await readWithNativeDetector(canvas)) {
+    if (!found.has(hit.value)) found.set(hit.value, hit)
+  }
+
+  // 第 1 轮：zxing 原图
   for (const r of await readOn(canvas)) {
     const hit = toHit(r, (x, y) => ({ x, y }))
     if (hit && !found.has(hit.value)) found.set(hit.value, hit)
@@ -301,6 +387,14 @@ async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
     if (found.size >= 3) break
   }
   return sortHits(found)
+}
+
+/** 扫描整图中的全部条码（含像素坐标），供一图多码流程复用 */
+export async function scanBarcodes(
+  canvas: HTMLCanvasElement,
+): Promise<{ value: string; box: { x: number; y: number; w: number; h: number } }[]> {
+  const hits = await decodeAllBarcodes(canvas)
+  return hits.map((h) => ({ value: h.value, box: h.box }))
 }
 
 function sortHits(found: Map<string, BarHit>): BarHit[] {
@@ -496,6 +590,18 @@ export function preloadOcr(): Promise<Worker> {
 const OCR_WHITELIST = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/:. '
 
 /**
+ * ⚠️ 孤儿函数（无调用方），保留但请勿当作在用代码 ——
+ *
+ * 自 Task 10 删除旧单条结果页 `ResultView.tsx` 后，`recognizeSn` 失去了唯一调用方：
+ * 整条「单拍 OCR」链路（连同其私有的 runServerOcr / extractTextStrip /
+ * cropBelowBarcode / containsBarcode）目前**既没有任何入口、也没有任何测试**，
+ * 但看起来仍像是活的，容易被后来者误以为在生效。
+ *
+ * 保留 / 删除**尚未决策**：删除时需连带更新 `multiRecognize.ts` 中以它为参照物的
+ * 设计说明注释（约 5 处）以及 `deviceFields.ts:3` 的注释，属于需要人工决策的范围。
+ * 在那之前，把它当作「无入口」的历史代码看待。
+ *
+ * —— 以下为原函数说明 ——
  * 双重识别：全量扫描条形码（本地 zxing）+ 服务端 OCR 优先（RapidOCR），
  * 服务端不可用时回退本地 Tesseract；然后比对。
  */
@@ -511,6 +617,7 @@ export async function recognizeSn(
 
   // ---- 2. OCR：优先服务端，失败则本地 Tesseract ----
   const runOcr = async (
+    worker: Worker,
     img: HTMLCanvasElement,
     psm: PSM,
     withLines = false,
@@ -560,16 +667,18 @@ export async function recognizeSn(
         const strip = extractTextStrip(canvas, b)
         if (strip) {
           try {
-            const { text } = await runOcr(strip, PSM.SINGLE_LINE)
+            const { text } = await runOcr(worker, strip, PSM.SINGLE_LINE)
             ocrTexts.push(text)
             const sn = findSn(text)
             if (sn) { ocr = sn; break }
-          } catch { /* ignore */ }
+          } catch (err) {
+            console.warn('[OCR 本地] 识别失败:', err)
+          }
         }
         // 2b-ii. 兜底：宽区域裁剪 + 逐行找标记
         const crop = cropBelowBarcode(canvas, b.box)
         try {
-          const { text, lines } = await runOcr(crop, PSM.SINGLE_BLOCK, true)
+          const { text, lines } = await runOcr(worker, crop, PSM.SINGLE_BLOCK, true)
           ocrTexts.push(text)
           let sn: string | null = null
           for (const ln of lines) {
@@ -578,7 +687,9 @@ export async function recognizeSn(
           }
           if (!sn) sn = findSn(text)
           if (sn) { ocr = sn; break }
-        } catch { /* ignore */ }
+        } catch (err) {
+          console.warn('[OCR 本地] 识别失败:', err)
+        }
       }
     }
 
@@ -586,22 +697,26 @@ export async function recognizeSn(
     if (!ocr) {
       onStage?.('OCR 全图识别…')
       try {
-        const { text } = await runOcr(canvas, PSM.SPARSE_TEXT)
+        const { text } = await runOcr(worker, canvas, PSM.SPARSE_TEXT)
         ocrTexts.push(text)
         ocr = findSn(text)
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.warn('[OCR 本地] 识别失败:', err)
+      }
     }
     if (!ocr) {
       onStage?.('OCR 二次识别…')
       try {
-        const { text, lines } = await runOcr(canvas, PSM.SINGLE_BLOCK, true)
+        const { text, lines } = await runOcr(worker, canvas, PSM.SINGLE_BLOCK, true)
         ocrTexts.push(text)
         for (const ln of lines) {
           ocr = findSn(ln)
           if (ocr) break
         }
         if (!ocr) ocr = findSn(text)
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.warn('[OCR 本地] 识别失败:', err)
+      }
     }
   }
 
