@@ -19,6 +19,7 @@ import json
 import time
 import logging
 import threading
+from sample_store import SAMPLE_DIR, MAX_SAMPLE_BYTES, save_sample
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logging.disable(logging.WARNING)  # 静音 RapidOCR 的初始化日志
@@ -78,11 +79,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/health"):
-            self._send(200, {"ok": True, "engine": "rapidocr"})
+            self._send(200, {"ok": True, "engine": "rapidocr", "sampleDir": str(SAMPLE_DIR)})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/ocr-samples":
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                if n <= 0 or n > MAX_SAMPLE_BYTES:
+                    self._send(413, {"error": "样本大小必须在 1 到 64 MiB 之间"})
+                    return
+                body = self.rfile.read(n)
+                if len(body) != n:
+                    raise ValueError("样本上传不完整")
+                self._send(200, save_sample(self.headers.get("Content-Type", ""), body))
+            except (ValueError, UnicodeError) as e:
+                self._send(400, {"error": str(e)})
+            except Exception as e:
+                self._send(500, {"error": str(e)})
+            return
         if not self.path.startswith("/ocr"):
             self._send(404, {"error": "not found"})
             return

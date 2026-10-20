@@ -6,6 +6,7 @@ import RecordsView from '@/sections/RecordsView'
 import ContinuousScanView from '@/sections/ContinuousScanView'
 import { useRecords } from '@/lib/store'
 import { deleteImages, putImage, saveDataUrlImage } from '@/lib/imageStore'
+import { importImage } from '@/lib/imagePayload'
 import type { SnRecord } from '@/types'
 
 type Screen =
@@ -22,8 +23,13 @@ type Screen =
   | { name: 'continuous' }
 
 export default function Home() {
-  const { records, addMany, remove, clear } = useRecords()
+  const { records, addMany, remove, clear, updateRecordImage } = useRecords()
   const [screen, setScreen] = useState<Screen>({ name: 'scan' })
+  const [processing, setProcessing] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const cameraRef = useRef<HTMLInputElement>(null)
+  const albumRef = useRef<HTMLInputElement>(null)
+  const processingRef = useRef(false)
 
   // key 的唯一性决定 MultiResultView 是否重挂载（靠重挂载清空其内部 result/failed/stage
   // 等状态）。不用 Date.now()：两次拍照落在同一毫秒时 key 相同 → React 不重挂载 →
@@ -108,21 +114,78 @@ export default function Home() {
     )
   }, [])
 
+  /**
+   * 相机/相册选中的原始文件 → ImagePayload。
+   *
+   * processingRef 是同步锁：解码 + 读 dataURL 要几百毫秒，这期间按钮虽然已置灰，
+   * 但置灰只影响**下一次渲染之后**的点击，同一帧里的连点仍能挤进来两次 importImage，
+   * 第二张图会走完 handleShot 把第一张顶掉（且第一张已经落盘成孤儿图）。
+   */
+  const processImage = useCallback(
+    async (load: () => Promise<ImagePayload>) => {
+      if (processingRef.current) return
+      processingRef.current = true
+      setProcessing(true)
+      setLoadError(null)
+      try {
+        const image = await load()
+        handleShot(image)
+      } catch (error) {
+        setLoadError(error instanceof Error ? error.message : '图片处理失败，请重试。')
+      } finally {
+        processingRef.current = false
+        setProcessing(false)
+      }
+    },
+    [handleShot],
+  )
+
+  /** System camera and album files retain their original bytes. */
+  const handleFile = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0]
+      // 先清空 value：否则连拍同一张照片时 change 不触发（值没变），
+      // 表现为「第二次拍照没反应」。取消选择时 files 为空，这里直接返回。
+      e.target.value = ''
+      if (file) void processImage(() => importImage(file))
+    },
+    [processImage],
+  )
+
+  /**
+   * 拉起系统相机。
+   *
+   * **只能在用户手势的同一个同步执行栈里调用** —— iOS Safari 要求 file input 的
+   * click() 与手势同属一个任务，晚一个 effect / 微任务就静默不弹：不抛错、不报错、
+   * 界面照常渲染，用户看到的就是「点了没反应」。这正是本项目最忌讳的失败方式，
+   * 所以这里不做任何 setTimeout / requestAnimationFrame 包装，也不放进 useEffect。
+   *
+   * 正因如此，两个 <input> 挂在 Home 上常驻，而不是放在 ScanView 里：
+   * 点「重拍 / 登记」那一刻 ScanView 还没挂载，元素根本不在 DOM 里。
+   */
+  const openCamera = useCallback(() => cameraRef.current?.click(), [])
+  const openAlbum = useCallback(() => albumRef.current?.click(), [])
+
   const handleRegister = useCallback(
     (list: Omit<SnRecord, 'id' | 'time'>[]) => {
       addMany(list)
       savingRef.current = false
       activeShotRef.current = null
       setScreen({ name: 'scan' })
+      // 登记完直接进下一张，省掉「回首页再点一次拍照识别」这一步。
+      // 与 setScreen 同在一个同步栈里，用户手势仍然有效。
+      openCamera()
     },
-    [addMany],
+    [addMany, openCamera],
   )
 
   const handleRetake = useCallback(() => {
     savingRef.current = false
     activeShotRef.current = null
     setScreen({ name: 'scan' })
-  }, [])
+    // 重拍同理：目的就是再拍一张，没有理由先回首页。
+    openCamera()
+  }, [openCamera])
   const openRecords = useCallback(() => setScreen({ name: 'records' }), [])
   const backToScan = useCallback(() => setScreen({ name: 'scan' }), [])
 
@@ -140,14 +203,13 @@ export default function Home() {
     }
   }, [screen.name])
 
+  let content: React.ReactNode
   if (screen.name === 'records') {
-    return <RecordsView records={records} onBack={backToScan} onRemove={remove} onClear={clear} />
-  }
-  if (screen.name === 'continuous') {
-    return <ContinuousScanView onClose={() => setScreen({ name: 'scan' })} />
-  }
-  if (screen.name === 'multi') {
-    return (
+    content = <RecordsView records={records} onBack={backToScan} onRemove={remove} onClear={clear} onUpdateImage={updateRecordImage} />
+  } else if (screen.name === 'continuous') {
+    content = <ContinuousScanView onClose={() => setScreen({ name: 'scan' })} />
+  } else if (screen.name === 'multi') {
+    content = (
       <MultiResultView
         key={screen.key}
         image={screen.image}
@@ -162,12 +224,35 @@ export default function Home() {
         imageSaveFailed={!screen.imageSaving && screen.imageId === null}
       />
     )
+  } else {
+    content = (
+      <ScanView
+        count={records.length}
+        onOpenCamera={openCamera}
+        onOpenAlbum={openAlbum}
+        onOpenRecords={openRecords}
+        processing={processing}
+        loadError={loadError}
+      />
+    )
   }
+
   return (
-    <ScanView
-      count={records.length}
-      onShot={handleShot}
-      onOpenRecords={openRecords}
-    />
+    <>
+      {/* 相机与相册入口挂在屏切换**之外**，永远不卸载 —— 见 openCamera 的注释：
+          点「重拍 / 登记」那一刻 ScanView 还没挂载，input 必须已经在 DOM 里，
+          手势当下的 click() 才点得到它。
+          拍照入口带 capture="environment"（直接开系统相机）；相册入口不带。 */}
+      <input
+        ref={cameraRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={handleFile}
+      />
+      <input ref={albumRef} type="file" accept="image/*" className="hidden" onChange={handleFile} />
+      {content}
+    </>
   )
 }

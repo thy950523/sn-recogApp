@@ -1,5 +1,9 @@
 import { useState } from 'react'
 import { copyAll, exportCsv, exportTxt } from '@/lib/export'
+import RecordImageEditor from '@/components/RecordImageEditor'
+import { Crop } from 'lucide-react'
+import type { Box4 } from '@/lib/deviceBoxes'
+import { formatBytes, IMAGE_EXPORT_OPTIONS, type ImageExportMode } from '@/lib/imageEditing'
 import type { ContinuousScanRecord, SnRecord } from '@/types'
 
 interface Props {
@@ -7,9 +11,12 @@ interface Props {
   onBack: () => void
   onRemove: (id: string) => void
   onClear: () => void
+  onUpdateImage: (id: string, crop: Box4 | null) => void
 }
 
-export default function RecordsView({ records, onBack, onRemove, onClear }: Props) {
+export default function RecordsView({ records, onBack, onRemove, onClear, onUpdateImage }: Props) {
+  const [editingRecord, setEditingRecord] = useState<SnRecord | null>(null)
+  const [imageMode, setImageMode] = useState<ImageExportMode>('compact')
   const [copied, setCopied] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   /** null = 未在导出；否则是当前进度 */
@@ -24,11 +31,11 @@ export default function RecordsView({ records, onBack, onRemove, onClear }: Prop
     try {
       // 动态 import：exceljs 约 1MB，不能拖进首屏
       const { exportExcel } = await import('@/lib/exportExcel')
-      const res = await exportExcel(records, (done, total) => setExcelProgress({ done, total }))
+      const res = await exportExcel(records, (done, total) => setExcelProgress({ done, total }), imageMode)
       setExcelNote(
         res.skipped > 0
-          ? `已导出 ${res.total} 条，其中 ${res.skipped} 条图片已丢失，缩略图列留空`
-          : `已导出 ${res.total} 条`,
+          ? `已导出 ${res.total} 条 · ${formatBytes(res.bytes)}；${res.skipped} 条图片缺失或处理失败，照片列留空`
+          : `已导出 ${res.total} 条 · ${formatBytes(res.bytes)}`,
       )
     } catch (err) {
       // 导出失败必须可见：静默失败会让用户以为表格已经存好了
@@ -72,6 +79,7 @@ export default function RecordsView({ records, onBack, onRemove, onClear }: Prop
         </div>
       )}
 
+      {editingRecord && <RecordImageEditor key={editingRecord.id} record={editingRecord} onClose={() => setEditingRecord(null)} onApply={crop => { onUpdateImage(editingRecord.id, crop); setEditingRecord(null) }} />}
       {/* 列表 */}
       <div className="flex-1 overflow-y-auto">
         {records.length === 0 && (
@@ -103,6 +111,7 @@ export default function RecordsView({ records, onBack, onRemove, onClear }: Prop
                 {new Date(r.time).toLocaleString('zh-CN', { hour12: false })}
               </p>
             </div>
+            {r.imageId && <button onClick={() => setEditingRecord(r)} aria-label={`查看与裁剪 ${r.sn}`} className="inline-flex min-h-10 shrink-0 items-center gap-1.5 border border-[#444] px-2 text-xs text-[#ffc700] hover:bg-[#202020] focus-visible:outline focus-visible:outline-[#ffc700]"><Crop size={15} /><span className="hidden sm:inline">查看与裁剪</span>{r.photoCrop && <span className="text-[10px]">已裁剪</span>}</button>}
             <button
               onClick={() => onRemove(r.id)}
               className="shrink-0 border border-[#2a2a2a] px-2.5 py-1.5 font-mono text-xs text-[#84898e] active:bg-[#161616]"
@@ -116,6 +125,13 @@ export default function RecordsView({ records, onBack, onRemove, onClear }: Prop
 
       {/* 底部导出区 */}
       <footer className="border-t border-[#1a1a1a] px-5 pt-4 pb-[max(env(safe-area-inset-bottom),20px)]">
+        <label className="mb-3 flex items-center justify-between gap-3 text-sm text-[#ccc]">
+          <span>Excel 图片大小</span>
+          <select aria-label="Excel 图片大小" disabled={!!excelProgress} value={imageMode} onChange={event => setImageMode(event.target.value as ImageExportMode)} className="min-h-10 border border-[#444] bg-[#161616] px-3 text-sm text-white focus-visible:outline focus-visible:outline-[#ffc700]">
+            {(Object.entries(IMAGE_EXPORT_OPTIONS) as [ImageExportMode, typeof IMAGE_EXPORT_OPTIONS[ImageExportMode]][]).map(([key, option]) => <option key={key} value={key}>{option.label}{key === 'compact' ? '（推荐）' : ''}</option>)}
+          </select>
+        </label>
+        <p className="mb-3 text-xs leading-5 text-[#aaa]">{imageMode === 'compact' ? '长边最多 1280 px，目标约 180 KB/张；相同图片与裁剪范围只嵌入一次。' : imageMode === 'clear' ? '长边最多 2400 px，目标约 600 KB/张，保留更多文字细节。' : imageMode === 'original' ? '嵌入原图或原分辨率裁剪图，文件可能较大。' : '只导出登记数据，不嵌入图片，文件最小。'}</p>
         {excelNote && (
           <p className="mb-2 font-mono text-[11px] text-[#84898e]">{excelNote}</p>
         )}
@@ -128,7 +144,7 @@ export default function RecordsView({ records, onBack, onRemove, onClear }: Prop
             ? excelProgress.total > 0
               ? `导出中 ${excelProgress.done}/${excelProgress.total}`
               : '导出中…'
-            : '导出 Excel（含图片）'}
+            : imageMode === 'text' ? '导出 Excel（仅文字）' : '导出 Excel（含图片）'}
         </button>
         <div className="grid grid-cols-2 gap-2">
           <button

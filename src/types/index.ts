@@ -1,3 +1,4 @@
+import type { Box4 } from '@/lib/deviceBoxes'
 export type VerifyStatus = 'match' | 'mismatch' | 'barcode_only' | 'ocr_only' | 'none' | 'pending'
 
 /** 一个 OCR 提取到的设备标识及其条码匹配结果 */
@@ -82,6 +83,9 @@ export interface SnRecord {
    * localStorage 只存这个 id，图片数据本身存在 IndexedDB。
    */
   imageId?: string
+  /** 裁剪仅影响预览和导出，原图仍完整保存。 */
+  photoCrop?: Box4 | null
+  photoOcrLines?: { text: string; box: Box4 }[]
 }
 
 /**

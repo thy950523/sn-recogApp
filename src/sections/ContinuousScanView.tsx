@@ -10,6 +10,7 @@ import type { ContinuousScanRecord } from '@/types'
 import { extractSnCandidates, preloadOcr } from '@/lib/recognize'
 import { extractDeviceFields, imeiBySlot, type DeviceFieldsResult } from '@/lib/deviceFields'
 import { copyAll } from '@/lib/export'
+import { saveRecognitionSample } from '@/lib/recognitionSamples'
 
 interface ContinuousScanViewProps {
   onClose: () => void
@@ -19,7 +20,7 @@ interface ContinuousScanViewProps {
  * OCR：把整帧原图发给服务器（RapidOCR 自带文字检测，会自己在整张贴纸里
  * 找到 S/N 等文字行，无需按条码坐标裁剪）。服务器不可用时回退本地 Tesseract。
  */
-async function runOcr(
+async function runOcrCore(
   canvas: HTMLCanvasElement,
   serverUrl: string,
   timeoutMs = 15000,
@@ -92,6 +93,29 @@ async function runOcr(
     console.warn('[OCR] 初始化失败:', err)
     return { text: null, viaServer: false }
   }
+}
+
+/** Freeze the frame before asynchronous OCR; the live camera keeps drawing. */
+async function runOcr(
+  canvas: HTMLCanvasElement,
+  serverUrl: string,
+  barcodes: string[],
+): Promise<{ text: string | null; viaServer: boolean; error?: string }> {
+  const frame = document.createElement('canvas')
+  frame.width = canvas.width
+  frame.height = canvas.height
+  frame.getContext('2d')!.drawImage(canvas, 0, 0)
+  const result = await runOcrCore(frame, serverUrl)
+  const fields = extractDeviceFields(result.text ?? '', barcodes)
+  const sn = fields.sn?.value ?? extractSnCandidates(result.text ?? '')[0] ?? null
+  if (!sn || !barcodes.includes(sn)) {
+    const sampleError = await saveRecognitionSample(frame, serverUrl, {
+      source: 'continuous', reasons: [sn ? 'mismatch' : 'barcode_only'],
+      rawText: result.text, barcodes, sn, ...result,
+    })
+    if (sampleError) result.error = [result.error, sampleError].filter(Boolean).join('；')
+  }
+  return result
 }
 
 export default function ContinuousScanView({ onClose }: ContinuousScanViewProps) {
@@ -264,7 +288,7 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
 
       ocrRunningRef.current = true
       void (async () => {
-        const result = await runOcr(canvas, serverUrl)
+        const result = await runOcr(canvas, serverUrl, [...barcodeListRef.current])
         ocrRunningRef.current = false
 
         setOcrError(result.error ?? null)
@@ -316,7 +340,9 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
     const canvas = canvasRef.current
     if (canvas) {
       void (async () => {
-        const { text } = await runOcr(canvas, serverUrl)
+        const result = await runOcr(canvas, serverUrl, [...barcodes])
+        if (result.error) setOcrError(result.error)
+        const { text } = result
         const f = extractDeviceFields(text ?? '', barcodes)
         const ocrSn = f.sn?.value ?? extractSnCandidates(text ?? '')[0] ?? null
         const found = ocrSn ? (barcodes.find(b => ocrSn === b) ?? null) : null
@@ -499,7 +525,7 @@ export default function ContinuousScanView({ onClose }: ContinuousScanViewProps)
       <footer className="border-t border-[#2a2a2a] bg-black/80 px-5 pt-3 pb-[max(env(safe-area-inset-bottom),20px)]">
         {ocrError && (
           <div className="mb-3 border border-[#f00007]/50 bg-[#f00007]/10 px-3 py-2 font-mono text-[10px] text-red-400">
-            ⚠ OCR服务器连接失败：{ocrError}（已自动使用本地OCR）
+            ⚠ {ocrError}
           </div>
         )}
         <div className="mb-3 flex items-center justify-between font-mono text-xs text-[#84898e]">

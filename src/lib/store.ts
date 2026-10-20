@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ContinuousScanRecord, SnRecord } from '@/types'
+import type { Box4 } from './deviceBoxes'
+import { validCrop } from './imageEditing'
 import { deleteImages } from './imageStore'
 
 const KEY = 'sn-scanner-records-v1'
@@ -99,6 +101,10 @@ export function useRecords() {
     setRecords((prev) => prev.filter((r) => !set.has(r.id)))
   }, [])
 
+  const updateRecordImage = useCallback((id: string, crop: Box4 | null) => {
+    setRecords(prev => prev.map(record => record.id === id ? { ...record, photoCrop: validCrop(crop) } : record))
+  }, [])
+
   const clear = useCallback(() => setRecords([]), [])
 
   const addContinuousRecord = useCallback(
@@ -166,6 +172,7 @@ export function useRecords() {
     clear,
     addContinuousRecord,
     updateRecordOcr,
+    updateRecordImage,
     getWarningRecords,
   }
 }

@@ -9,9 +9,8 @@
  * `xl/cellimages.xml`。点单元格能直接选中图，排序/筛选/删行时图片跟着走。
  * 结构细节与兼容性代价（微软 Excel 打开显示 `#NAME?`）见 wpsCellImages.ts。
  *
- * 照片**不做二次编码**：存的本来就是拍摄载荷的原始 JPEG，这里再解码→画布→重压
- * 一遍，等于把用户特意要保住的那点画质又扔了 —— 而且这是整条链路上最后一次机会。
- * 只有 MIME 不被图片部件支持、或记录的宽高不可用（老数据/坏数据）时才退回重编码。
+ * 默认使用精简 JPEG，支持清晰、原图、仅文字模式；裁剪在导出时从原图生成。
+ * 原始图片仍完整保留在 IndexedDB，压缩结果不覆盖原图。
  *
  * 同一张照片被多条记录引用时（一图多码），`xl/media/` 里**只存一份**，多个单元格
  * 引用同一个 ID。WPS 自己也是这么做的 —— 样本文件里就有同一个 ID 被两个单元格引用。
@@ -22,6 +21,8 @@
 import type { SnRecord } from '@/types'
 import type { Worksheet } from 'exceljs'
 import { getImage, type StoredImage } from './imageStore'
+import { imageVariantKey, renderImage, validCrop, type ImageExportMode } from './imageEditing'
+import type { Box4 } from './deviceBoxes'
 import { addCellImages, dispImgFormula, newCellImageId, type CellImagePart } from './wpsCellImages'
 
 /**
@@ -149,52 +150,28 @@ async function blobBytes(blob: Blob): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer())
 }
 
-/** 把 Blob 画到 canvas 并缩放到目标尺寸，返回 JPEG 字节 */
-async function reencodeJpeg(
-  blob: Blob,
-  maxW: number,
-  maxH: number,
-  quality: number,
-): Promise<{ bytes: Uint8Array; width: number; height: number } | null> {
+/** Export derivatives are generated once per image/crop variant. */
+async function photoForExcel(
+  stored: StoredImage,
+  mode: Exclude<ImageExportMode, 'text'>,
+  crop?: Box4 | null,
+): Promise<{ bytes: Uint8Array; extension: 'jpeg' | 'png'; cell: PhotoCell } | null> {
   try {
-    const bitmap = await createImageBitmap(blob)
-    const { width, height } = fitSize(bitmap.width, bitmap.height, maxW, maxH)
-    if (!width || !height) return null
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const ctx = canvas.getContext('2d')!
-    ctx.drawImage(bitmap, 0, 0, width, height)
-    bitmap.close()
-    const out = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, 'image/jpeg', quality),
-    )
-    if (!out) return null
-    return { bytes: await blobBytes(out), width, height }
+    const extension = excelImageExtension(stored.blob.type)
+    const cell = photoCell(stored.width, stored.height)
+    if (mode === 'original' && !validCrop(crop) && extension && cell) {
+      return { bytes: await blobBytes(stored.blob), extension, cell }
+    }
+    const rendered = await renderImage(stored.blob, crop, mode)
+    // A small original may be smaller than recompression; keep the smaller valid image.
+    if (!validCrop(crop) && extension && cell && stored.blob.size < rendered.blob.size) {
+      return { bytes: await blobBytes(stored.blob), extension, cell }
+    }
+    const renderedCell = photoCell(rendered.width, rendered.height)
+    return renderedCell ? { bytes: await blobBytes(rendered.blob), extension: 'jpeg', cell: renderedCell } : null
   } catch {
     return null
   }
-}
-
-/**
- * 要嵌进照片格子的那张图：**能用原始字节就用原始字节**，不做二次编码。
- *
- * 只有两种情况下才退回重编码：MIME 不是我们声明得了的格式，或记录的宽高不可用
- * （老数据 / 坏数据）。此时宁可有损也不能让整次导出炸掉。
- */
-async function photoForExcel(
-  stored: StoredImage,
-): Promise<{ bytes: Uint8Array; extension: 'jpeg' | 'png'; cell: PhotoCell } | null> {
-  const extension = excelImageExtension(stored.blob.type)
-  const cell = photoCell(stored.width, stored.height)
-  if (extension && cell) {
-    return { bytes: await blobBytes(stored.blob), extension, cell }
-  }
-  const fallback = await reencodeJpeg(stored.blob, PHOTO_MAX_W, PHOTO_MAX_H, 0.9)
-  if (!fallback) return null
-  const fallbackCell = photoCell(fallback.width, fallback.height)
-  if (!fallbackCell) return null
-  return { bytes: fallback.bytes, extension: 'jpeg', cell: fallbackCell }
 }
 
 /** 像素 → Excel 列宽（字符数）。经验公式：px ≈ width * 7 + 5 */
@@ -223,6 +200,8 @@ export interface ExportExcelResult {
   total: number
   /** 本该有图、但图片已丢失或编码失败，照片列留空的记录数 */
   skipped: number
+  bytes: number
+  imageBytes: number
 }
 
 /**
@@ -232,6 +211,7 @@ export interface ExportExcelResult {
 export async function exportExcel(
   records: SnRecord[],
   onProgress?: (done: number, total: number) => void,
+  mode: ImageExportMode = 'compact',
 ): Promise<ExportExcelResult> {
   const mod = await import('exceljs')
   const ExcelJS = (mod as unknown as { default?: typeof import('exceljs') }).default ?? mod
@@ -275,7 +255,7 @@ export async function exportExcel(
   //
   // 取整条记录（而非只取 Blob）：照片格子要给行高，行高得按原始宽高算，
   // 只有 Blob 的话就得 createImageBitmap 解码一次去量 —— 而我们恰恰想避免解码。
-  const neededIds = [...new Set(records.map((r) => r.imageId).filter((id): id is string => !!id))]
+  const neededIds = mode === 'text' ? [] : [...new Set(records.map((r) => r.imageId).filter((id): id is string => !!id))]
   const images = new Map<string, StoredImage | null>()
   for (const id of neededIds) images.set(id, await getImage(id))
 
@@ -283,10 +263,10 @@ export async function exportExcel(
   // 完全没有 imageId 的记录不计入 —— 那是纯文字记录，不是图片丢失，
   // 否则纯文字导出会每次都弹「12 条中 12 条图片缺失」。
   let skipped = 0
-  const withImage: { rowIndex: number; imageId: string; fileName: string }[] = []
+  const withImage: { rowIndex: number; imageId: string; fileName: string; crop?: Box4 | null }[] = []
 
   records.forEach((r, i) => {
-    const fileName = r.imageId ? imageFileName(i + 1, r.sn) : ''
+    const fileName = r.imageId && mode !== 'text' ? imageFileName(i + 1, r.sn) : ''
     const row: Record<string, string | number> = {
       idx: i + 1,
       sn: r.sn,
@@ -303,8 +283,8 @@ export async function exportExcel(
     ws.addRow(row)
     // 行高与 DISPIMG 公式**都不在这里**写：照片的格子尺寸取决于它自己的宽高比
     // （竖图 480px、横图 270px），要等下面拿到图片尺寸才知道。这里只登记待办。
-    if (r.imageId) {
-      if (images.get(r.imageId)) withImage.push({ rowIndex: i + 2, imageId: r.imageId, fileName })
+    if (r.imageId && mode !== 'text') {
+      if (images.get(r.imageId)) withImage.push({ rowIndex: i + 2, imageId: r.imageId, fileName, crop: r.photoCrop })
       else skipped++ // 图片已丢失：照片列留空，计入上报
     }
   })
@@ -326,15 +306,16 @@ export async function exportExcel(
     const stored = images.get(item.imageId)
     if (!stored) continue // 已在上面计入 skipped
 
-    let hit = embedded.get(item.imageId)
+    const variant = imageVariantKey(item.imageId, item.crop)
+    let hit = embedded.get(variant)
     if (!hit) {
-      const photo = await photoForExcel(stored)
+      const photo = await photoForExcel(stored, mode as Exclude<ImageExportMode, 'text'>, item.crop)
       if (!photo) {
         skipped++ // blob 在但解码/编码失败：同样算这条记录没图上
         continue
       }
       hit = { id: newCellImageId(), cell: photo.cell }
-      embedded.set(item.imageId, hit)
+      embedded.set(variant, hit)
       parts.push({
         id: hit.id,
         // 序号即部件序号：媒体文件名只要在本包内唯一即可
@@ -370,5 +351,5 @@ export async function exportExcel(
   a.remove()
   setTimeout(() => URL.revokeObjectURL(url), 4000)
 
-  return { total: records.length, skipped }
+  return { total: records.length, skipped, bytes: blob.size, imageBytes: parts.reduce((sum, part) => sum + part.bytes.byteLength, 0) }
 }

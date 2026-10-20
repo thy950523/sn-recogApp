@@ -1,26 +1,32 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { preloadOcr } from '@/lib/recognize'
-import { importImage, type ImagePayload } from '@/lib/imagePayload'
 
 interface Props {
   count: number
-  onShot: (image: ImagePayload) => void
+  /**
+   * 拉起系统相机。
+   *
+   * 由 Home 提供，且**必须在用户手势的同一个同步执行栈里调用** ——
+   * iOS Safari 只认手势当下发出的 file input click()，晚一个 effect 或微任务
+   * 就静默不弹（不抛错、不给任何反馈）。详见 Home.openCamera 的注释。
+   */
+  onOpenCamera: () => void
+  onOpenAlbum: () => void
   onOpenRecords: () => void
+  /** 相机/相册返回的原始文件正在解码，期间两个入口都要置灰并改文案 */
+  processing: boolean
+  loadError: string | null
 }
 
-export default function ScanView({ count, onShot, onOpenRecords }: Props) {
-  const camRef = useRef<HTMLInputElement>(null)
-  const albumRef = useRef<HTMLInputElement>(null)
+export default function ScanView({
+  count,
+  onOpenCamera,
+  onOpenAlbum,
+  onOpenRecords,
+  processing,
+  loadError,
+}: Props) {
   const [engineReady, setEngineReady] = useState(false)
-  const [loadError, setLoadError] = useState<string | null>(null)
-  const [processing, setProcessing] = useState(false)
-  const processingRef = useRef(false)
-  const mountedRef = useRef(true)
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => { mountedRef.current = false }
-  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -31,32 +37,6 @@ export default function ScanView({ count, onShot, onOpenRecords }: Props) {
       cancelled = true
     }
   }, [])
-
-  const processImage = useCallback(async (load: () => Promise<ImagePayload>) => {
-    if (processingRef.current) return
-    processingRef.current = true
-    setProcessing(true)
-    setLoadError(null)
-    try {
-      const image = await load()
-      if (!mountedRef.current) return
-      onShot(image)
-    } catch (error) {
-      if (mountedRef.current) {
-        setLoadError(error instanceof Error ? error.message : '图片处理失败，请重试。')
-      }
-    } finally {
-      processingRef.current = false
-      if (mountedRef.current) setProcessing(false)
-    }
-  }, [onShot])
-
-  /** System camera and album files retain their original bytes. */
-  const handleFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    e.target.value = ''
-    if (file) void processImage(() => importImage(file))
-  }, [processImage])
 
   return (
     <div className="flex h-[100dvh] flex-col bg-black text-white select-none">
@@ -100,30 +80,22 @@ export default function ScanView({ count, onShot, onOpenRecords }: Props) {
             {loadError}
           </p>
         )}
+        {/* 相机/相册两个 input 本体在 Home —— 它们必须常驻挂载，
+            否则从识别页「重拍/登记」直接拉起相机时拿不到元素。这里只留按钮。 */}
         <button
           disabled={processing}
-          onClick={() => camRef.current?.click()}
+          onClick={onOpenCamera}
           className="w-full bg-white py-4 font-mono text-base font-bold tracking-[0.3em] text-black uppercase active:bg-[#d9d9d9]"
         >
           {processing ? '正在准备照片…' : '拍照识别'}
         </button>
         <button
           disabled={processing}
-          onClick={() => albumRef.current?.click()}
+          onClick={onOpenAlbum}
           className="mt-2 w-full border border-[#2a2a2a] py-3 font-mono text-xs tracking-[0.2em] text-[#c9c9c9] uppercase active:bg-[#161616]"
         >
           从相册导入照片
         </button>
-        {/* 图片类型限定拍照；相册入口不设置 capture。 */}
-        <input
-          ref={camRef}
-          type="file"
-          accept="image/*"
-          capture="environment"
-          className="hidden"
-          onChange={handleFile}
-        />
-        <input ref={albumRef} type="file" accept="image/*" className="hidden" onChange={handleFile} />
       </footer>
     </div>
   )

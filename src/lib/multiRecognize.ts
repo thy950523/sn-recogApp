@@ -21,6 +21,7 @@ import {
 } from './deviceFields'
 import { assignNearest, boxCenterY, normalizeBox, type Box4 } from './deviceBoxes'
 import type { VerifyStatus } from '@/types'
+import { sampleReasons, saveRecognitionSample } from './recognitionSamples'
 
 /** OCR 返回的一行文字及其归一化坐标 */
 export interface OcrLine {
@@ -342,6 +343,8 @@ export interface MultiRecognizeResult {
   /** true = 服务器不可用已降级（无坐标，不画框） */
   degraded: boolean
   error: string | null
+  ocrLines?: OcrLine[]
+  sampleError?: string | null
 }
 
 /** 服务端 OCR 返回体 */
@@ -450,7 +453,7 @@ export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
  * @param canvas 原始照片画布（像素坐标）
  * @param serverUrl OCR 服务地址（通常传 window.location.origin，走 Vite 代理）
  */
-export async function recognizeMulti(
+async function recognizeMultiCore(
   canvas: HTMLCanvasElement,
   serverUrl: string,
   onStage?: (stage: string) => void,
@@ -481,6 +484,7 @@ export async function recognizeMulti(
     // 有坐标就用坐标，**与文本是否为空无关** —— 坐标比文本强。
     if (lines.length) {
       return {
+        ocrLines: lines,
         devices: buildCandidates(lines, barcodes),
         rawText: serverText,
         engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
@@ -561,4 +565,22 @@ export async function recognizeMulti(
     degraded: true,
     error: '服务器 OCR 不可用，已降级本地识别（无法标注位置）',
   }
+}
+
+/** Archive after final classification, including local OCR fallback and empty results. */
+export async function recognizeMulti(
+  canvas: HTMLCanvasElement,
+  serverUrl: string,
+  onStage?: (stage: string) => void,
+  original?: Blob,
+): Promise<MultiRecognizeResult> {
+  const result = await recognizeMultiCore(canvas, serverUrl, onStage, original)
+  const reasons = sampleReasons(result)
+  if (reasons.length) {
+    onStage?.('正在保存优化样本…')
+    result.sampleError = await saveRecognitionSample(canvas, serverUrl, {
+      source: 'photo', reasons, ...result,
+    }, original)
+  }
+  return result
 }

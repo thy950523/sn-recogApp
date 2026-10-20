@@ -268,6 +268,19 @@ async function runRapid(buf) {
 const app = express()
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
 
+// Sample uploads use the same archive regardless of the OCR entry point.
+app.post('/ocr-samples', express.raw({ type: 'multipart/form-data', limit: '64mb' }), async (req, res) => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${RAPID_PORT}/ocr-samples`, {
+      method: 'POST', headers: { 'Content-Type': req.headers['content-type'] },
+      body: req.body, signal: AbortSignal.timeout(10000),
+    })
+    res.status(response.status).type('json').send(await response.text())
+  } catch (err) {
+    res.status(503).json({ error: `样本服务不可用: ${err.message}` })
+  }
+})
+
 // 支持 binary ArrayBuffer 和 JSON base64 两种格式
 app.post('/ocr', express.raw({ type: ['image/png', 'image/jpeg', 'application/octet-stream'], limit: '10mb' }), async (req, res) => {
   let buf, id

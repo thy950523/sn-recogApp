@@ -11,6 +11,9 @@ import {
 } from '@/lib/registerRows'
 import type { Box4 } from '@/lib/deviceBoxes'
 import type { SnRecord } from '@/types'
+import ImageWorkbench from '@/components/ImageWorkbench'
+import { dataUrlToBlob } from '@/lib/imageStore'
+import { Crop } from 'lucide-react'
 import type { ImagePayload } from '@/lib/imagePayload'
 
 export type { ImagePayload } from '@/lib/imagePayload'
@@ -82,6 +85,8 @@ export default function MultiResultView({
   imageSaving,
   imageSaveFailed,
 }: Props) {
+  const [editorBlob, setEditorBlob] = useState<Blob | null>(null)
+  const [photoCrop, setPhotoCrop] = useState<Box4 | null>(null)
   const [stage, setStage] = useState('准备识别…')
   const [result, setResult] = useState<MultiRecognizeResult | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
@@ -262,7 +267,9 @@ export default function MultiResultView({
     ])
 
   const register = () => {
-    const list = rowsToRecords(rows, imageId)
+    const list = rowsToRecords(rows, imageId).map(record => ({
+      ...record, photoCrop, photoOcrLines: result?.ocrLines ?? [],
+    }))
     if (list.length) onRegister(list)
   }
 
@@ -382,6 +389,11 @@ export default function MultiResultView({
         </div>
       )}
 
+      <div className="mx-4 mb-2 flex items-center justify-between gap-2">
+        <p className="text-xs text-[#aaa]">{photoCrop ? '已设置导出裁剪范围' : '完整图片 · 可查看所有 OCR 文字框'}</p>
+        <button disabled={!result} onClick={() => setEditorBlob(image.blob ?? dataUrlToBlob(image.dataUrl))} className="inline-flex min-h-10 shrink-0 items-center gap-2 border border-[#444] px-3 text-xs text-[#ffc700] hover:bg-[#202020] focus-visible:outline focus-visible:outline-[#ffc700] disabled:opacity-40"><Crop size={16} />查看与裁剪</button>
+      </div>
+      {editorBlob && <ImageWorkbench src={image.dataUrl} blob={editorBlob} width={image.width} height={image.height} lines={result?.ocrLines ?? []} rawText={result?.rawText} initialCrop={photoCrop} onApply={crop => { setPhotoCrop(crop); setEditorBlob(null) }} onClose={() => setEditorBlob(null)} />}
       {/* 原图 + 标注层 */}
       <div className="relative mx-4 border border-[#1f1f1f] bg-[#0a0a0a]">
         {/* 外层 w-fit + 内层 max-h + max-w-full 三者缺一不可，**不要**简化。
@@ -452,6 +464,11 @@ export default function MultiResultView({
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-3">
+        {result?.sampleError && (
+          <p role="alert" className="border border-[#ffc700]/40 p-3 text-sm text-[#ffc700]">
+            ⚠ {result.sampleError}
+          </p>
+        )}
         {failed && (
           <div className="border border-[#f00007]/40 bg-[#f00007]/10 p-4 font-mono text-sm text-[#ff6b6b]">
             识别出错：{failed}，请重拍。

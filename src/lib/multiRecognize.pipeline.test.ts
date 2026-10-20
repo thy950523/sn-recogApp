@@ -45,6 +45,7 @@ describe('image recognition pipeline', () => {
     completeScan([{ value: 'AB123456', box: { x: 120, y: 320, w: 480, h: 80 } }])
     const result = await pending
     expect(result.devices[0].status).toBe('match')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(result.devices[0].barcodeBoxes[0]).toEqual([0.1, 0.2, 0.5, 0.25])
     expect(createElement).toHaveBeenCalledTimes(1)
   })
@@ -78,4 +79,37 @@ describe('image recognition pipeline', () => {
     expect(options.headers).toEqual(expect.objectContaining({ 'Content-Type': 'image/jpeg' }))
     expect(toBlob).toHaveBeenCalledOnce()
   })
+  it('archives an OCR-only photo once with original bytes and final candidates', async () => {
+    const { canvas, fetchMock } = setup()
+    scanBarcodes.mockResolvedValueOnce([])
+    const original = new Blob(['keep original'], { type: 'image/jpeg' })
+    const result = await recognizeMulti(canvas, '/server', undefined, original)
+    expect(result.devices[0].status).toBe('ocr_only')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [url, options] = fetchMock.mock.calls[1] as unknown as [string, RequestInit]
+    expect(url).toBe('/server/ocr-samples')
+    const form = options.body as FormData
+    expect(await (form.get('image') as Blob).text()).toBe('keep original')
+    expect(JSON.parse(form.get('metadata') as string)).toMatchObject({
+      reasons: ['ocr_only'], devices: [{ sn: 'AB123456', status: 'ocr_only' }],
+    })
+    expect(result.sampleError).toBeNull()
+  })
+
+  it('retains candidates and reports a failed sample upload', async () => {
+    const { canvas, fetchMock } = setup()
+    scanBarcodes.mockResolvedValueOnce([])
+    const normalResponse = await fetchMock()
+    fetchMock.mockClear()
+    fetchMock.mockResolvedValueOnce(normalResponse).mockRejectedValueOnce(new Error('disk service offline'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const result = await recognizeMulti(canvas, '/server', undefined, new Blob(['original']))
+      expect(result.devices[0].sn).toBe('AB123456')
+      expect(result.sampleError).toContain('保存失败')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
 })
