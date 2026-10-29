@@ -41,7 +41,7 @@ describe('image recognition pipeline', () => {
     expect(fetchMock).toHaveBeenCalledWith('/server/ocr', expect.objectContaining({ body: original }))
     expect(toBlob).not.toHaveBeenCalled()
     const scan = scanBarcodes.mock.calls[0][0]
-    expect([scan.width, scan.height]).toEqual([1200, 1600])
+    expect([scan.width, scan.height]).toEqual([1800, 2400])
     completeScan([{ value: 'AB123456', box: { x: 120, y: 320, w: 480, h: 80 } }])
     const result = await pending
     expect(result.devices[0].status).toBe('match')

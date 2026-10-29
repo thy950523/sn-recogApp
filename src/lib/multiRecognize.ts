@@ -354,6 +354,17 @@ interface ServerOcrResponse {
   lines?: { text: string; conf: number; box: number[] }[]
 }
 
+/** 条码扫描输入的最长边。
+ *
+ * **不要降到 1600。** iOS Safari 没有原生 BarcodeDetector，拍照链路只能靠 zxing；
+ * 实测一张 4032×3024 的正常照片（S/N、IMEI1/2 三条 Code128 + 一个 EAN-13）：
+ *   · 1600px：只解出 EAN-13，三条 Code128 全丢 → 界面报「条码与 OCR 不一致」；
+ *   · 2400px：五条全部解出，耗时 93ms（1600px 是 83ms，多出的几十毫秒可忽略）。
+ * 根因是缩到 1600 后每根条码线只剩 ~1px，zxing 的采样分辨率不够；而在这台
+ * 有原生检测器的电脑上一直被原生结果掩盖，所以只在 iPhone 上暴露。
+ * 2400 与 3200 / 原图的解出结果相同，取 2400 以控制老手机的耗时与内存。 */
+const BARCODE_SCAN_MAX_EDGE = 2400
+
 /** Independent scan/upload adaptation; never replaces the saved original. */
 function scaleForUpload(canvas: HTMLCanvasElement, maxEdge: number): HTMLCanvasElement {
   const longest = Math.max(canvas.width, canvas.height)
@@ -448,6 +459,42 @@ export function markUnverified(devices: DeviceCandidate[]): DeviceCandidate[] {
 }
 
 /**
+ * 深度重扫：把「OCR 认出了 S/N，但整张图都没读到这个条码」的值再找一遍。
+ *
+ * 这是「条码与 OCR 不一致」最常见的来源 —— 数据本身没错，是条码那一路漏读了。
+ * 实测（iPhone 拍华为包装盒）首轮在 2400px 上只能解出 EAN-13；改用
+ * zxing 的增强放大 + 旋转轮次后，5 条 Code128/DataMatrix 全部解出。
+ * 代价是桌面端 5~8 秒、手机更久，所以只在确认缺失时才跑，并把这些 S/N
+ * 作为 need 传进去 —— 一旦读齐立刻停止旋转，通常不用跑完整圈。
+ *
+ * 失败时返回原列表：重扫是「加分项」，不能让一张本来能用的照片因为重扫报错而失败。
+ */
+async function rescanMissingSns(
+  scanCanvas: HTMLCanvasElement,
+  barcodes: DetectedBarcode[],
+  missing: string[],
+): Promise<DetectedBarcode[]> {
+  if (!missing.length) return barcodes
+  let raw: { value: string; box: { x: number; y: number; w: number; h: number } }[] = []
+  try {
+    const { scanBarcodes } = await import('./recognize')
+    raw = await scanBarcodes(scanCanvas, { thorough: true, need: missing })
+  } catch (err) {
+    console.warn('[条码] 深度重扫失败：', err)
+    return barcodes
+  }
+
+  const seen = new Set(barcodes.map((b) => b.value))
+  const merged = [...barcodes]
+  for (const b of raw) {
+    if (seen.has(b.value)) continue
+    seen.add(b.value)
+    merged.push({ value: b.value, box: normalizeBox(b.box, scanCanvas.width, scanCanvas.height) })
+  }
+  return merged
+}
+
+/**
  * 一图多码识别主入口。
  *
  * @param canvas 原始照片画布（像素坐标）
@@ -463,7 +510,7 @@ async function recognizeMultiCore(
   // not delay the independent server request. callServerOcr always resolves.
   onStage?.('正在扫描条码并识别文字…')
   const serverPromise = callServerOcr(canvas, serverUrl, 20000, original)
-  const scanCanvas = scaleForUpload(canvas, 1600)
+  const scanCanvas = scaleForUpload(canvas, BARCODE_SCAN_MAX_EDGE)
   const barcodePromise = import('./recognize').then(({ scanBarcodes }) => scanBarcodes(scanCanvas))
   const [rawBarcodes, server] = await Promise.all([barcodePromise, serverPromise])
   const barcodes: DetectedBarcode[] = rawBarcodes.map((b) => ({
@@ -483,9 +530,35 @@ async function recognizeMultiCore(
 
     // 有坐标就用坐标，**与文本是否为空无关** —— 坐标比文本强。
     if (lines.length) {
+      let finalBarcodes = barcodes
+      let devices = buildCandidates(lines, finalBarcodes)
+
+      // 触发深度重扫的条件只有这一个：OCR 认出了 S/N 锚点，但**整张图**的条码里
+      // 没有这个值。这不是「标签上没印条码」（这些设备都印），而是条码一路漏读 ——
+      // 若不重扫，这台设备会被标成「条码与 OCR 不一致」，用户只能重拍。
+      //
+      // 用整图条码集合判断，而不是看某台设备的 status：条码可能读到了但被归给了
+      // 邻居（几何归属错误），那种情况重扫也解决不了，界面上的「不一致」是有效信号。
+      const readValues = new Set(finalBarcodes.map((b) => b.value))
+      const missing = [
+        ...new Set(
+          devices
+            .filter((d) => d.anchor === 'marker' && !readValues.has(d.sn))
+            .map((d) => d.sn),
+        ),
+      ]
+      if (missing.length) {
+        onStage?.('条码未读全，正在深度重扫…')
+        const merged = await rescanMissingSns(scanCanvas, finalBarcodes, missing)
+        if (merged.length > finalBarcodes.length) {
+          finalBarcodes = merged
+          devices = buildCandidates(lines, finalBarcodes)
+        }
+      }
+
       return {
         ocrLines: lines,
-        devices: buildCandidates(lines, barcodes),
+        devices,
         rawText: serverText,
         engine: server.engine === 'rapidocr' ? 'rapidocr' : 'tesseract',
         degraded: false,

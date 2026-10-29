@@ -290,8 +290,10 @@ function getNativeDetector(): Promise<BarcodeDetector | null> {
  *
  * zxing 在这张图上没有单调性（3/2/0/3/0/1/0），换 `binarizer` / `tryDownscale` /
  * `downscaleFactor` 都救不回来 —— 它是真的读不出来，不是参数没调对。
- * 而 App 实际喂进来的载荷最长边只有 1600（竖拍手机视频 1080×1920 → 载荷 900×1600），
- * 落在上表后半段正是**一个条码都读不到**，用户报的「没识别到条形码」就是这么来的。
+ * 而拍照链路早期只把 1600px 的载荷喂进来，落在上表后半段正是**一个条码都读不到**，
+ * 用户报的「没识别到条形码」就是这么来的。现在 `multiRecognize` 按
+ * BARCODE_SCAN_MAX_EDGE（2400）送进来，实测同一张图五条全部解出；
+ * 但 iOS Safari 没有原生检测器，这条链路只有 zxing，分辨率不能再降。
  *
  * 相机预览（`ContinuousScanView` → `CameraEngine`）本来就在用原生检测器，
  * 只有拍照链路一直在裸用 zxing，这是两条链路识别率差异的来源。
@@ -332,25 +334,56 @@ async function readWithNativeDetector(canvas: HTMLCanvasElement): Promise<BarHit
   }
 }
 
+export interface ScanBarcodesOptions {
+  /**
+   * 深度重扫：不再「找到任意条码就收工」，而是把增强放大与整圈旋转都跑完。
+   *
+   * 默认的「找到就走」是为单条码场景省时间的：一张图里只要有条码就返回。
+   * 但一图多码的标签（华为包装盒：IMEI1 / S/N / IMEI2 / EID 四条 Code128）
+   * 首轮常常只解出 3~4 条；此时早退会让后面的增强、旋转轮次永远不执行，
+   * 漏掉的那条如果是 S/N，界面就会把一台好设备报成「条码与 OCR 不一致」。
+   *
+   * 代价是真实存在的：整圈旋转（±44°，步长 4°）在桌面端 5~8 秒，
+   * 手机上更久。所以只在**已经确认某个 S/N 的条码没读到**时才开，并配合 need 提前收工。
+   */
+  thorough?: boolean
+  /**
+   * 提前收工条件：这些值全部解出后立即停止后续轮次。
+   *
+   * 约定传「OCR 认出了、但条码一路没读到的 S/N」。通常转到某个小角度就能停，
+   * 不必跑完整圈。need 为空时 thorough 必须把整圈跑完 —— 调用方应避免这种用法。
+   */
+  need?: readonly string[]
+}
+
 /** 扫描照片中的全部条形码；正拍读不到时做旋转扫描，应对倾斜拍摄 */
-async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
+async function decodeAllBarcodes(
+  canvas: HTMLCanvasElement,
+  { thorough = false, need = [] }: ScanBarcodesOptions = {},
+): Promise<BarHit[]> {
   const found = new Map<string, BarHit>()
+  const merge = (hits: BarHit[]) => {
+    for (const hit of hits) if (!found.has(hit.value)) found.set(hit.value, hit)
+  }
+  /** need 全部找到（need 为空时永不早停） */
+  const satisfied = () => need.length > 0 && need.every((v) => found.has(v))
 
   // 第 0 轮：原生 BarcodeDetector。放在最前是因为两件事：
   //   · 它的**框**比 zxing 准（实测同一条码 zxing 报 2.9px 高、原生报 34px），
   //     而下面每个分支都是 `!found.has(...)` 才写入 —— 先写谁就留谁的框；
   //   · 它只花约 30ms，比 zxing 那几轮便宜得多。
   // 两个引擎的结果取并集而不是二选一：它们的失败模式不同，谁都可能读到对方读不到的。
-  for (const hit of await readWithNativeDetector(canvas)) {
-    if (!found.has(hit.value)) found.set(hit.value, hit)
-  }
+  merge(await readWithNativeDetector(canvas))
 
   // 第 1 轮：zxing 原图
   for (const r of await readOn(canvas)) {
     const hit = toHit(r, (x, y) => ({ x, y }))
-    if (hit && !found.has(hit.value)) found.set(hit.value, hit)
+    if (hit) merge([hit])
   }
-  if (found.size) return sortHits(found)
+  if (satisfied()) return sortHits(found)
+  // 注意这个 return 只在**普通**扫描里成立：一图多码时「读到某一条」远不等于读全，
+  // 深度重扫必须继续往下走。
+  if (!thorough && found.size) return sortHits(found)
 
   // 第 2 轮：1.75x + 增强锐化（远距离小条码）
   const s2 = Math.min(1.75, 3200 / Math.max(canvas.width, 1))
@@ -361,9 +394,10 @@ async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
     unsharpMask(sctx, scaled.width, scaled.height)
     for (const r of await readOn(scaled)) {
       const hit = toHit(r, (x, y) => ({ x: x / s2, y: y / s2 }))
-      if (hit && !found.has(hit.value)) found.set(hit.value, hit)
+      if (hit) merge([hit])
     }
-    if (found.size) return sortHits(found)
+    if (satisfied()) return sortHits(found)
+    if (!thorough && found.size) return sortHits(found)
   }
 
   // 第 3 轮：旋转扫描（倾斜拍摄）。不同角度可能各读出不同条码，取并集
@@ -381,10 +415,12 @@ async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
         const p = unrotatePoint(x, y, angle, rot)
         return { x: p.x / s3, y: p.y / s3 }
       })
-      if (hit && !found.has(hit.value)) found.set(hit.value, hit)
+      if (hit) merge([hit])
     }
-    // 已找到 3 个以上则提前结束
-    if (found.size >= 3) break
+    // 深度重扫：缺的那几个 S/N 都找到了就停，通常不用跑完整圈
+    if (satisfied()) break
+    // 普通扫描：已找到 3 个以上则提前结束（一图多码时这个阈值本就不该拿来当「读全」）
+    if (!thorough && found.size >= 3) break
   }
   return sortHits(found)
 }
@@ -392,8 +428,9 @@ async function decodeAllBarcodes(canvas: HTMLCanvasElement): Promise<BarHit[]> {
 /** 扫描整图中的全部条码（含像素坐标），供一图多码流程复用 */
 export async function scanBarcodes(
   canvas: HTMLCanvasElement,
+  options: ScanBarcodesOptions = {},
 ): Promise<{ value: string; box: { x: number; y: number; w: number; h: number } }[]> {
-  const hits = await decodeAllBarcodes(canvas)
+  const hits = await decodeAllBarcodes(canvas, options)
   return hits.map((h) => ({ value: h.value, box: h.box }))
 }
 
