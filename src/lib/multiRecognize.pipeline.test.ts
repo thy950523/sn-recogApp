@@ -46,7 +46,7 @@ describe('image recognition pipeline', () => {
     const result = await pending
     expect(result.devices[0].status).toBe('match')
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(result.devices[0].barcodeBoxes[0]).toEqual([0.1, 0.2, 0.5, 0.25])
+    expect(result.devices[0].barcodeBoxes[0]).toEqual([120 / 1800, 320 / 2400, 600 / 1800, 400 / 2400])
     expect(createElement).toHaveBeenCalledTimes(1)
   })
 
