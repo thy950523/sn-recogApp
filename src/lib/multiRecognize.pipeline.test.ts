@@ -41,13 +41,31 @@ describe('image recognition pipeline', () => {
     expect(fetchMock).toHaveBeenCalledWith('/server/ocr', expect.objectContaining({ body: original }))
     expect(toBlob).not.toHaveBeenCalled()
     const scan = scanBarcodes.mock.calls[0][0]
-    expect([scan.width, scan.height]).toEqual([1200, 1600])
+    expect([scan.width, scan.height]).toEqual([1800, 2400])
     completeScan([{ value: 'AB123456', box: { x: 120, y: 320, w: 480, h: 80 } }])
     const result = await pending
     expect(result.devices[0].status).toBe('match')
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(result.devices[0].barcodeBoxes[0]).toEqual([0.1, 0.2, 0.5, 0.25])
+    expect(result.devices[0].barcodeBoxes[0]).toEqual([120 / 1800, 320 / 2400, 600 / 1800, 400 / 2400])
     expect(createElement).toHaveBeenCalledTimes(1)
+  })
+
+  it('deep-rescans a missing S/N barcode instead of reporting a false mismatch', async () => {
+    const { canvas } = setup()
+    // 首轮只读到画面里别的码，S/N 这条 Code128 漏了 —— 这正是实机上「不一致」的来源。
+    scanBarcodes
+      .mockResolvedValueOnce([{ value: 'OTHER1234', box: { x: 10, y: 10, w: 100, h: 40 } }])
+      .mockResolvedValueOnce([
+        { value: 'AB123456', box: { x: 120, y: 320, w: 480, h: 80 } },
+        { value: 'OTHER1234', box: { x: 10, y: 10, w: 100, h: 40 } },
+      ])
+    const result = await recognizeMulti(canvas, '/server', undefined, new Blob(['x']))
+
+    expect(scanBarcodes).toHaveBeenCalledTimes(2)
+    expect(scanBarcodes.mock.calls[1][1]).toEqual({ thorough: true, need: ['AB123456'] })
+    const device = result.devices.find((d) => d.sn === 'AB123456')
+    expect(device?.status).toBe('match')
+    expect(device?.barcode).toBe('AB123456')
   })
 
   it('adapts oversized uploads without sending or changing the original blob', async () => {
@@ -81,7 +99,8 @@ describe('image recognition pipeline', () => {
   })
   it('archives an OCR-only photo once with original bytes and final candidates', async () => {
     const { canvas, fetchMock } = setup()
-    scanBarcodes.mockResolvedValueOnce([])
+    // 首轮与「深度重扫」两路都没有条码，才是真正的 ocr_only
+    scanBarcodes.mockResolvedValue([])
     const original = new Blob(['keep original'], { type: 'image/jpeg' })
     const result = await recognizeMulti(canvas, '/server', undefined, original)
     expect(result.devices[0].status).toBe('ocr_only')
@@ -98,7 +117,7 @@ describe('image recognition pipeline', () => {
 
   it('retains candidates and reports a failed sample upload', async () => {
     const { canvas, fetchMock } = setup()
-    scanBarcodes.mockResolvedValueOnce([])
+    scanBarcodes.mockResolvedValue([])
     const normalResponse = await fetchMock()
     fetchMock.mockClear()
     fetchMock.mockResolvedValueOnce(normalResponse).mockRejectedValueOnce(new Error('disk service offline'))

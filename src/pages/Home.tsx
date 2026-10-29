@@ -25,6 +25,15 @@ type Screen =
 export default function Home() {
   const { records, addMany, remove, clear, updateRecordImage } = useRecords()
   const [screen, setScreen] = useState<Screen>({ name: 'scan' })
+  /**
+   * 识别页上的「已登记」覆盖层。
+   *
+   * 为什么用覆盖层而不是切到 records 屏：切屏会把 MultiResultView 卸载，
+   * 再回来时 OCR 重跑、候选的勾选/编辑/删行与裁剪范围全部清零 —— 用户只是想
+   * 翻一眼库里已有设备，却要为此丢掉刚核对好的结果。覆盖层让识别页保持挂载，
+   * 返回时状态原样还在。
+   */
+  const [recordsOpen, setRecordsOpen] = useState(false)
   const [processing, setProcessing] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const cameraRef = useRef<HTMLInputElement>(null)
@@ -200,6 +209,9 @@ export default function Home() {
     if (screen.name !== 'multi') {
       savingRef.current = false
       activeShotRef.current = null
+      // 覆盖层只属于 multi 屏。若不在离开时关掉，下次再进识别页会一进来
+      // 就被上一层已登记列表盖住（而且看起来像「打不开识别结果」）。
+      setRecordsOpen(false)
     }
   }, [screen.name])
 
@@ -210,19 +222,36 @@ export default function Home() {
     content = <ContinuousScanView onClose={() => setScreen({ name: 'scan' })} />
   } else if (screen.name === 'multi') {
     content = (
-      <MultiResultView
-        key={screen.key}
-        image={screen.image}
-        existingSns={records.map((r) => r.sn)}
-        onRetake={handleRetake}
-        onRegister={handleRegister}
-        imageId={screen.imageId}
-        imageSaving={screen.imageSaving}
-        // 「存图失败」只在落盘**结束后**才成立。落盘期间 imageId 也是 null，
-        // 若直接用 `imageId === null` 判失败，刚进识别页就会闪一条
-        // 「照片未能保存」的黄条 —— 那是在报一个还没发生、且多半不会发生的错。
-        imageSaveFailed={!screen.imageSaving && screen.imageId === null}
-      />
+      <>
+        <MultiResultView
+          key={screen.key}
+          image={screen.image}
+          existingSns={records.map((r) => r.sn)}
+          onRetake={handleRetake}
+          onRegister={handleRegister}
+          imageId={screen.imageId}
+          imageSaving={screen.imageSaving}
+          // 「存图失败」只在落盘**结束后**才成立。落盘期间 imageId 也是 null，
+          // 若直接用 `imageId === null` 判失败，刚进识别页就会闪一条
+          // 「照片未能保存」的黄条 —— 那是在报一个还没发生、且多半不会发生的错。
+          imageSaveFailed={!screen.imageSaving && screen.imageId === null}
+          registered={records}
+          onOpenRecords={() => setRecordsOpen(true)}
+        />
+        {/* 覆盖层固定在视口上，识别页与其状态一起留在下面；返回即原样恢复 */}
+        {recordsOpen && (
+          <div className="fixed inset-0 z-50 bg-black">
+            <RecordsView
+              records={records}
+              onBack={() => setRecordsOpen(false)}
+              onRemove={remove}
+              onClear={clear}
+              onUpdateImage={updateRecordImage}
+              backLabel="← 返回识别结果"
+            />
+          </div>
+        )}
+      </>
     )
   } else {
     content = (
