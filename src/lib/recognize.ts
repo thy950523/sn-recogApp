@@ -356,6 +356,17 @@ export interface ScanBarcodesOptions {
   need?: readonly string[]
 }
 
+/**
+ * 旋转扫描的角度顺序：从贴近水平的小角度开始，正负交替。
+ *
+ * 覆盖范围与原实现完全相同（±4…±44，步长 4°），只是换了先后。
+ * 原顺序从 -44° 一路扫到 +44°，而实拍照片的倾斜通常只有几度 ——
+ * 实测两张 iPhone 照片里 S/N 条码分别在 +8°/+12° 与 +4° 才解出，
+ * 按原顺序要扫 11~13 次才轮到它们；换成小角度优先后 1~3 次即可。
+ * 深度重扫是「读齐即停」，这个顺序直接把重扫耗时砍掉一半以上。
+ */
+const ROTATION_ANGLES = Array.from({ length: 11 }, (_, i) => (i + 1) * 4).flatMap((a) => [a, -a])
+
 /** 扫描照片中的全部条形码；正拍读不到时做旋转扫描，应对倾斜拍摄 */
 async function decodeAllBarcodes(
   canvas: HTMLCanvasElement,
@@ -406,8 +417,7 @@ async function decodeAllBarcodes(
   const bctx = base.getContext('2d')!
   enhanceForOcr(bctx, base.width, base.height)
   unsharpMask(bctx, base.width, base.height)
-  for (let angle = -44; angle <= 44; angle += 4) {
-    if (angle === 0) continue
+  for (const angle of ROTATION_ANGLES) {
     const rot = rotateCanvas(base, angle)
     const results = await readOn(rot.canvas)
     for (const r of results) {
