@@ -42,6 +42,13 @@ interface Props {
    * 会让刚进识别页就闪一条还没发生的错误。
    */
   imageSaveFailed?: boolean
+  /**
+   * 已登记设备。页头「已登记」按钮在**本页内**展开这张清单 —— 核对候选时
+   * 需要对照库里已有的 SN/IMEI，不该为此离开识别结果。
+   */
+  registered: SnRecord[]
+  /** 打开完整登记记录页（看照片、裁剪、导出；以覆盖层呈现） */
+  onOpenRecords: () => void
 }
 
 /**
@@ -84,6 +91,8 @@ export default function MultiResultView({
   imageId,
   imageSaving,
   imageSaveFailed,
+  registered,
+  onOpenRecords,
 }: Props) {
   const [editorBlob, setEditorBlob] = useState<Blob | null>(null)
   const [photoCrop, setPhotoCrop] = useState<Box4 | null>(null)
@@ -226,6 +235,8 @@ export default function MultiResultView({
   const { primaryIdx, secondaryIdx } = partitionCandidates(rows)
   /** 疑似候选区的展开状态。主列表为空时它没有意义（见 secondaryOpen） */
   const [showSecondary, setShowSecondary] = useState(false)
+  /** 已登记设备面板的展开状态（页内展开，不离开识别结果） */
+  const [showRegistered, setShowRegistered] = useState(false)
   // 一条可信候选都没有时，疑似候选就是本次识别的全部结果，必须直接铺开：
   // 藏起来会让用户以为「什么都没识别到」而重拍。此时也不渲染折叠按钮 ——
   // 那个按钮点不动（展开状态被这里强制为 true），是个静默失效的控件。
@@ -371,13 +382,86 @@ export default function MultiResultView({
         <div className="font-mono text-[11px] tracking-[0.25em] text-[#84898e] uppercase">
           批量识别&nbsp;/&nbsp;{headline(failed, !!result, primaryIdx.length, secondaryIdx.length)}
         </div>
-        <button
-          onClick={onRetake}
-          className="border border-[#2a2a2a] px-3 py-1.5 font-mono text-xs text-[#c9c9c9] active:bg-[#161616]"
-        >
-          重拍
-        </button>
+        <div className="flex items-center gap-2">
+          {/* 与首页「已登记」入口同一形态，但在这里是**页内展开**：核对候选时
+              要对照库里已有的 SN/IMEI，不该为此离开识别结果（离开会卸载本页，
+              勾选、编辑与裁剪范围都会丢）。 */}
+          <button
+            onClick={() => setShowRegistered((v) => !v)}
+            aria-expanded={showRegistered}
+            className="flex items-center gap-2 border border-[#2a2a2a] px-3 py-1.5 font-mono text-xs active:bg-[#161616]"
+          >
+            <span className="text-[#ffc700]">{String(registered.length).padStart(3, '0')}</span>
+            <span className="text-[#c9c9c9]">{showRegistered ? '收起' : '已登记'}</span>
+          </button>
+          <button
+            onClick={onRetake}
+            className="border border-[#2a2a2a] px-3 py-1.5 font-mono text-xs text-[#c9c9c9] active:bg-[#161616]"
+          >
+            重拍
+          </button>
+        </div>
       </header>
+
+      {/* 已登记设备（页内列表）：直接摊在识别结果上方，边核对候选边对照。
+          只展示一台设备一行；照片、裁剪、导出仍在完整记录页（覆盖层），
+          所以这里给一个明确入口，避免用户以为「这里就是全部功能」。 */}
+      {showRegistered && (
+        <div className="mx-4 mb-2 border border-[#2a2a2a] bg-[#0a0a0a]">
+          <div className="flex items-center justify-between border-b border-[#2a2a2a] px-3 py-2">
+            <p className="font-mono text-[10px] tracking-widest text-[#84898e] uppercase">
+              已登记 {registered.length} 台
+            </p>
+            <button
+              onClick={onOpenRecords}
+              className="font-mono text-[10px] text-[#ffc700] active:opacity-70"
+            >
+              完整记录与照片 →
+            </button>
+          </div>
+          {registered.length === 0 ? (
+            <p className="px-3 py-4 font-mono text-[11px] text-[#555]">暂无登记记录</p>
+          ) : (
+            <div className="max-h-[32dvh] overflow-y-auto">
+              {registered.map((r, i) => {
+                // 只拼实际存在的字段：IMEI2/MEID/EID 大多为空，空标签比没有更吵。
+                const detail = [
+                  r.imei && `IMEI ${r.imei}`,
+                  r.imei2 && `IMEI2 ${r.imei2}`,
+                  r.meid && `MEID ${r.meid}`,
+                  r.eid && `EID ${r.eid}`,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')
+                return (
+                  <div
+                    key={r.id}
+                    className="flex items-start gap-2 border-b border-[#141414] px-3 py-2 last:border-b-0"
+                  >
+                    <span className="w-8 shrink-0 font-mono text-[10px] text-[#555]">
+                      #{String(i + 1).padStart(3, '0')}
+                    </span>
+                    <span
+                      className={`mt-1 h-1.5 w-1.5 shrink-0 ${r.verified ? 'bg-[#35d07f]' : 'bg-[#ffc700]'}`}
+                      title={r.verified ? '双重验证一致' : '人工确认'}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-mono text-xs tracking-[0.12em] text-white">
+                        {r.sn}
+                      </p>
+                      {detail && (
+                        <p className="mt-0.5 break-all font-mono text-[10px] leading-4 text-[#777]">
+                          {detail}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 存图失败的非阻塞提示：放在页头下方、标注层之上，识别中/失败时也始终可见。
           存图失败不中断流程（记录照样能登记），但若只 console.warn，用户会以为照片

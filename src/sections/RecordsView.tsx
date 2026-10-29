@@ -12,9 +12,14 @@ interface Props {
   onRemove: (id: string) => void
   onClear: () => void
   onUpdateImage: (id: string, crop: Box4 | null) => void
+  /**
+   * 返回按钮文案。默认是首页进入时的「继续扫描」；从识别页的覆盖层打开时
+   * 要改成「返回识别结果」—— 那才是这一下真正会回到的地方。
+   */
+  backLabel?: string
 }
 
-export default function RecordsView({ records, onBack, onRemove, onClear, onUpdateImage }: Props) {
+export default function RecordsView({ records, onBack, onRemove, onClear, onUpdateImage, backLabel = '← 继续扫描' }: Props) {
   const [editingRecord, setEditingRecord] = useState<SnRecord | null>(null)
   const [imageMode, setImageMode] = useState<ImageExportMode>('compact')
   const [copied, setCopied] = useState(false)
@@ -65,7 +70,7 @@ export default function RecordsView({ records, onBack, onRemove, onClear, onUpda
           onClick={onBack}
           className="border border-[#2a2a2a] px-3 py-1.5 font-mono text-xs text-[#c9c9c9] active:bg-[#161616]"
         >
-          ← 继续扫描
+          {backLabel}
         </button>
         <div className="font-mono text-[11px] tracking-[0.25em] text-[#84898e] uppercase">
           登记记录&nbsp;
